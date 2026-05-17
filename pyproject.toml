@@ -1,7 +1,7 @@
 [project]
-name = "studio-concierge"
+name = "mcpdf"
 version = "0.1.0"
-description = "MCP server that indexes and searches PDF manuals using LM Studio embeddings"
+description = "MCP server that indexes and searches PDFs using a local OpenAI-compatible embeddings endpoint"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "wgriffin", email = "wgriffin@fraktured.net" }]
@@ -16,15 +16,15 @@ dependencies = [
 ]
 
 [project.scripts]
-studio-concierge = "studio_concierge.server:main"
-studio-concierge-index = "studio_concierge.cli:main"
+mcpdf = "mcpdf.server:main"
+mcpdf-index = "mcpdf.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/studio_concierge"]
+packages = ["src/mcpdf"]
 
 [tool.uv]
 # The framework Python from python.org disables sqlite3 extension loading,

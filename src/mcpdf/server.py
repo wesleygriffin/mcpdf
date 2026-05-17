@@ -12,7 +12,7 @@ from mcp.types import TextContent, Tool
 from . import db, indexer
 from .config import Config
 
-log = logging.getLogger("studio-concierge")
+log = logging.getLogger("mcpdf")
 
 
 def _format_search_results(query: str, hits: list[db.SearchHit]) -> str:
@@ -36,7 +36,7 @@ def _format_search_results(query: str, hits: list[db.SearchHit]) -> str:
 
 
 def build_server(cfg: Config) -> Server:
-    server: Server = Server("studio-concierge")
+    server: Server = Server("mcpdf")
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
@@ -189,7 +189,7 @@ async def _run() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     cfg = Config.from_env()
-    log.info("studio-concierge starting; db=%s model=%s", cfg.db_path, cfg.embedding_model)
+    log.info("mcpdf starting; db=%s model=%s", cfg.db_path, cfg.embedding_model)
     server = build_server(cfg)
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())

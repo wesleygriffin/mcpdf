@@ -11,7 +11,7 @@ from .config import Config
 
 
 async def _amain(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="studio-concierge-index")
+    parser = argparse.ArgumentParser(prog="mcpdf-index")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_index = sub.add_parser("index", help="Index a directory or single PDF")
