@@ -1,0 +1,261 @@
+/**
+ * mcpdf Worker — remote MCP server for PDF search.
+ *
+ * Exposes four MCP tools backed by Workers AI (query embedding), Vectorize
+ * (chunk vectors + metadata), and D1 (per-document rows). The local
+ * `mcpdf-index upload` CLI populates Vectorize and D1; this Worker only
+ * reads/deletes from them.
+ *
+ * Vector ID format MUST stay in sync with `src/mcpdf/cli.py::_vector_id`:
+ *     `${sha256(path).slice(0,16)}:${chunkIndex.toString().padStart(5,'0')}`
+ */
+
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpAgent } from "agents/mcp";
+import { z } from "zod";
+
+export interface Env {
+  AI: Ai;
+  VECTORIZE: Vectorize;
+  DB: D1Database;
+  MCP_OBJECT: DurableObjectNamespace<McpdfAgent>;
+  MCP_AUTH_TOKEN?: string;
+  WORKERS_AI_EMBED_MODEL?: string;
+  // Set per-corpus via `[vars]` in wrangler.toml. Shown by claude.ai as the
+  // connector's MCP server name; useful for distinguishing corpora.
+  CORPUS_NAME?: string;
+}
+
+interface DocumentRow {
+  path: string;
+  title: string;
+  content_sha256: string;
+  total_pages: number;
+  chunk_count: number;
+  indexed_at: string;
+}
+
+interface ChunkMetadata {
+  document_path?: string;
+  document_title?: string;
+  page_start?: number;
+  page_end?: number;
+  text?: string;
+}
+
+const DEFAULT_EMBED_MODEL = "@cf/google/embeddinggemma-300m";
+
+export class McpdfAgent extends McpAgent<Env> {
+  server = new McpServer({
+    name: this.env.CORPUS_NAME ?? "mcpdf",
+    version: "0.1.0",
+  });
+
+  async init() {
+    this.server.registerTool(
+      "search",
+      {
+        description:
+          "Semantic search over indexed PDF chunks. Returns the most relevant " +
+          "chunks with their document title, page range, and surrounding text.",
+        inputSchema: {
+          query: z.string().min(1).describe("Natural-language query to embed and match."),
+          top_k: z
+            .number()
+            .int()
+            .min(1)
+            .max(50)
+            .default(8)
+            .describe("Number of chunks to return (1-50)."),
+          document_path: z
+            .string()
+            .optional()
+            .describe("If set, restrict results to chunks from this document path."),
+        },
+      },
+      async ({ query, top_k, document_path }) => {
+        const embedding = await embedQuery(this.env, query);
+        const queryOpts: VectorizeQueryOptions = {
+          topK: top_k,
+          returnMetadata: "all",
+        };
+        if (document_path) {
+          queryOpts.filter = { document_path };
+        }
+        const result = await this.env.VECTORIZE.query(embedding, queryOpts);
+        const hits = result.matches.map((m) => {
+          const meta = (m.metadata ?? {}) as ChunkMetadata;
+          return {
+            id: m.id,
+            score: m.score,
+            document_path: meta.document_path ?? null,
+            document_title: meta.document_title ?? null,
+            page_start: meta.page_start ?? null,
+            page_end: meta.page_end ?? null,
+            text: meta.text ?? "",
+          };
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify({ hits }, null, 2) }],
+        };
+      },
+    );
+
+    this.server.registerTool(
+      "list_documents",
+      {
+        description: "List every indexed document with title, page count, chunk count, and indexed timestamp.",
+        inputSchema: {},
+      },
+      async () => {
+        const { results } = await this.env.DB.prepare(
+          "SELECT path, title, content_sha256, total_pages, chunk_count, indexed_at " +
+            "FROM documents ORDER BY title COLLATE NOCASE",
+        ).all<DocumentRow>();
+        return {
+          content: [
+            { type: "text", text: JSON.stringify({ documents: results ?? [] }, null, 2) },
+          ],
+        };
+      },
+    );
+
+    this.server.registerTool(
+      "get_document_info",
+      {
+        description: "Look up a single document's metadata by its indexed path.",
+        inputSchema: {
+          path: z.string().min(1).describe("Document path as stored at upload time."),
+        },
+      },
+      async ({ path }) => {
+        const row = await this.env.DB.prepare(
+          "SELECT path, title, content_sha256, total_pages, chunk_count, indexed_at " +
+            "FROM documents WHERE path = ?",
+        )
+          .bind(path)
+          .first<DocumentRow>();
+        if (!row) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ found: false, path }) }],
+          };
+        }
+        return {
+          content: [{ type: "text", text: JSON.stringify({ found: true, document: row }, null, 2) }],
+        };
+      },
+    );
+
+    this.server.registerTool(
+      "remove_document",
+      {
+        description:
+          "Remove a document from the index: deletes all its chunk vectors from Vectorize " +
+          "and its row from D1. Idempotent (returns ok even if nothing was indexed).",
+        inputSchema: {
+          path: z.string().min(1).describe("Document path as stored at upload time."),
+        },
+      },
+      async ({ path }) => {
+        const row = await this.env.DB.prepare(
+          "SELECT chunk_count FROM documents WHERE path = ?",
+        )
+          .bind(path)
+          .first<{ chunk_count: number }>();
+        if (!row) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ removed: false, path, reason: "not_indexed" }) }],
+          };
+        }
+        const ids = await chunkIds(path, row.chunk_count);
+        await this.env.VECTORIZE.deleteByIds(ids);
+        await this.env.DB.prepare("DELETE FROM documents WHERE path = ?").bind(path).run();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { removed: true, path, vectors_deleted: ids.length },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      },
+    );
+  }
+}
+
+async function embedQuery(env: Env, text: string): Promise<number[]> {
+  const model = env.WORKERS_AI_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  const result = (await env.AI.run(model as keyof AiModels, { text: [text] } as never)) as {
+    data?: number[][];
+  };
+  const vec = result.data?.[0];
+  if (!vec) {
+    throw new Error(`Workers AI returned no embedding for model ${model}`);
+  }
+  return vec;
+}
+
+async function chunkIds(path: string, chunkCount: number): Promise<string[]> {
+  const prefix = await sha256Hex(path).then((h) => h.slice(0, 16));
+  const ids: string[] = [];
+  for (let i = 0; i < chunkCount; i++) {
+    ids.push(`${prefix}:${i.toString().padStart(5, "0")}`);
+  }
+  return ids;
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const bytes = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function unauthorized(): Response {
+  return new Response("unauthorized\n", {
+    status: 401,
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      "www-authenticate": 'Bearer realm="mcpdf"',
+    },
+  });
+}
+
+function checkAuth(request: Request, env: Env): Response | null {
+  if (!env.MCP_AUTH_TOKEN) return null;
+  const header = request.headers.get("authorization");
+  if (!header) return unauthorized();
+  const [scheme, token] = header.split(" ", 2);
+  if (scheme?.toLowerCase() !== "bearer" || token !== env.MCP_AUTH_TOKEN) {
+    return unauthorized();
+  }
+  return null;
+}
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/healthz") {
+      return new Response("ok\n", {
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
+    }
+
+    if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
+      const denied = checkAuth(request, env);
+      if (denied) return denied;
+      return McpdfAgent.serve("/mcp").fetch(request, env, ctx);
+    }
+
+    return new Response("not found\n", {
+      status: 404,
+      headers: { "content-type": "text/plain; charset=utf-8" },
+    });
+  },
+} satisfies ExportedHandler<Env>;

@@ -1,22 +1,20 @@
 [project]
 name = "mcpdf"
-version = "0.1.0"
-description = "MCP server that indexes and searches PDFs using a local OpenAI-compatible embeddings endpoint"
+version = "0.2.0"
+description = "Local indexer that extracts, chunks, and uploads PDFs to a Cloudflare Vectorize-backed search index"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "wgriffin", email = "wgriffin@fraktured.net" }]
 dependencies = [
-    "mcp>=1.2.0",
     "httpx>=0.27",
     "pymupdf>=1.24",
-    "sqlite-vec>=0.1.6",
     "pydantic>=2.7",
     "python-dotenv>=1.0",
-    "tiktoken>=0.7",
+    "tokenizers>=0.20",
+    "huggingface-hub>=0.23",
 ]
 
 [project.scripts]
-mcpdf = "mcpdf.server:main"
 mcpdf-index = "mcpdf.cli:main"
 
 [build-system]

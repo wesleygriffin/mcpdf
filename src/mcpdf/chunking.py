@@ -3,14 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-import tiktoken
-
 from .pdf import PdfPage
-
-# cl100k_base is the GPT-3.5/4 encoder. Used here only as a stable token *budget*
-# approximation — the Nomic models have their own tokenizer, but we don't need
-# exact alignment, just a reliable cap so we never exceed the model's input limit.
-_ENCODING = tiktoken.get_encoding("cl100k_base")
+from .tokenizer import GemmaTokenizer
 
 
 @dataclass(frozen=True)
@@ -21,40 +15,33 @@ class Chunk:
     token_count: int
 
 
-def _tokenize(text: str) -> list[int]:
-    return _ENCODING.encode(text, disallowed_special=())
-
-
-def _detokenize(tokens: list[int]) -> str:
-    return _ENCODING.decode(tokens)
-
-
 def chunk_pages(
     pages: Iterable[PdfPage],
+    tokenizer: GemmaTokenizer,
     *,
     chunk_tokens: int,
     overlap_tokens: int,
 ) -> list[Chunk]:
     """Build overlapping token-budgeted chunks while tracking source page ranges.
 
-    Pages are concatenated into a single token stream tagged with their source
-    page index, then a sliding window walks the stream producing chunks that
-    record the first and last page they touch.
+    Pages are concatenated into a single (token, page_number) stream; a sliding
+    window walks the stream producing chunks that record the first and last
+    page they touch. Token boundaries are the embedder's own — EmbeddingGemma's
+    SentencePiece — so the resulting count is exactly what Workers AI will see.
     """
     if chunk_tokens <= 0:
         raise ValueError("chunk_tokens must be positive")
     if overlap_tokens < 0 or overlap_tokens >= chunk_tokens:
         raise ValueError("overlap_tokens must be in [0, chunk_tokens)")
 
-    # Build a flat list of (token, page_number) pairs.
     flat: list[tuple[int, int]] = []
+    newline_ids = tokenizer.encode_ids("\n")
     for page in pages:
         if not page.text:
             continue
-        for tok in _tokenize(page.text):
+        for tok in tokenizer.encode_ids(page.text):
             flat.append((tok, page.page_number))
-        # Treat the page break as a single newline token so chunks read naturally.
-        for tok in _tokenize("\n"):
+        for tok in newline_ids:
             flat.append((tok, page.page_number))
 
     if not flat:
@@ -65,17 +52,15 @@ def chunk_pages(
     i = 0
     while i < len(flat):
         window = flat[i : i + chunk_tokens]
-        tokens = [t for t, _ in window]
-        page_start = window[0][1]
-        page_end = window[-1][1]
-        text = _detokenize(tokens).strip()
+        ids = [t for t, _ in window]
+        text = tokenizer.decode(ids).strip()
         if text:
             chunks.append(
                 Chunk(
                     text=text,
-                    page_start=page_start,
-                    page_end=page_end,
-                    token_count=len(tokens),
+                    page_start=window[0][1],
+                    page_end=window[-1][1],
+                    token_count=len(ids),
                 )
             )
         if i + chunk_tokens >= len(flat):

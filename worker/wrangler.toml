@@ -1,0 +1,76 @@
+# mcpdf Worker — one deployment per corpus.
+#
+# A "corpus" is the triple (Vectorize index, D1 database, deployed Worker URL).
+# Each corpus is isolated: own URL, own data, own auth token, own DO state.
+#
+# Single-corpus quick start: edit the top-level config below and deploy with
+# `wrangler deploy`. The worker will be reachable at
+# https://mcpdf.<your-subdomain>.workers.dev/mcp.
+#
+# Multi-corpus: copy the commented [env.example] block at the bottom of this
+# file for each additional corpus. Deploy with `wrangler deploy --env <name>`.
+# Bindings are NOT inherited from top-level into [env.X] blocks — that's a
+# wrangler design choice, not an oversight.
+
+# === Default corpus ===
+name = "mcpdf"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+[ai]
+binding = "AI"
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "mcpdf"
+
+# Create with: wrangler d1 create mcpdf
+# Then paste the printed UUID into database_id below.
+[[d1_databases]]
+binding = "DB"
+database_name = "mcpdf"
+database_id = "REPLACE_WITH_WRANGLER_D1_CREATE_OUTPUT"
+
+[[durable_objects.bindings]]
+name = "MCP_OBJECT"
+class_name = "McpdfAgent"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["McpdfAgent"]
+
+# Shown by claude.ai as the connector's server name.
+[vars]
+CORPUS_NAME = "mcpdf"
+
+# === Additional corpora — copy this whole block, change every "example" ===
+#
+# [env.example]
+# name = "mcpdf-example"
+#
+# [env.example.ai]
+# binding = "AI"
+#
+# [[env.example.vectorize]]
+# binding = "VECTORIZE"
+# index_name = "mcpdf-example"
+#
+# [[env.example.d1_databases]]
+# binding = "DB"
+# database_name = "mcpdf-example"
+# database_id = "REPLACE_WITH_WRANGLER_D1_CREATE_OUTPUT"
+#
+# [[env.example.durable_objects.bindings]]
+# name = "MCP_OBJECT"
+# class_name = "McpdfAgent"
+#
+# [[env.example.migrations]]
+# tag = "v1"
+# new_sqlite_classes = ["McpdfAgent"]
+#
+# [env.example.vars]
+# CORPUS_NAME = "mcpdf-example"
