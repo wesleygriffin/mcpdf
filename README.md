@@ -10,8 +10,9 @@ can reach it. The local CLI now does PDF extraction and bulk upload only.
 
 A **corpus** is the triple (Vectorize index, D1 database, deployed Worker URL).
 Each corpus is fully isolated — own URL, own data, own auth token, own Durable
-Object state. You can run a single corpus (defaults to `mcpdf`) or many — see
-[Multiple corpora](#multiple-corpora).
+Object state. Every corpus lives under its own `[env.X]` block in
+`wrangler.toml`; there is no privileged default. See
+[Adding a corpus](#adding-a-corpus).
 
 ## Layout
 
@@ -125,89 +126,35 @@ The MCP endpoint is `/mcp` (Streamable HTTP). `/healthz` returns `ok` for
 uptime checks. The agent runs as a SQLite-backed Durable Object — one
 instance per session — declared in `wrangler.toml` under `MCP_OBJECT`.
 
-### Provision Cloudflare resources
+There is no privileged "default" corpus — every corpus is its own `[env.X]`
+block in `wrangler.toml`. Every `wrangler` command needs `--env <corpus>`;
+running it without `--env` deliberately errors.
+
+### Adding a corpus
+
+Walkthrough for a corpus named `studio` (the same recipe with `studio` →
+`<name>` applies to any corpus). All `wrangler` commands run from `worker/`.
 
 ```sh
 cd worker
-npx wrangler vectorize create mcpdf --dimensions=768 --metric=cosine
-npx wrangler d1 create mcpdf
-# Paste the printed D1 UUID into wrangler.toml under database_id.
-
-# Create the documents table:
-npx wrangler d1 execute mcpdf --remote --command "CREATE TABLE documents (
-  path TEXT PRIMARY KEY,
-  title TEXT NOT NULL,
-  content_sha256 TEXT NOT NULL,
-  total_pages INTEGER NOT NULL,
-  chunk_count INTEGER NOT NULL,
-  indexed_at TEXT NOT NULL
-);"
 ```
 
-Vectorize's `search` tool filters by `document_path`. To make that filter
-fast, also create a metadata index (cheap, one-time):
-
-```sh
-npx wrangler vectorize create-metadata-index mcpdf \
-  --property-name=document_path --type=string
-```
-
-### Local dev
-
-```sh
-cd worker
-npm install
-npm run dev      # http://127.0.0.1:8787/healthz
-```
-
-`wrangler dev` uses remote bindings by default for AI / Vectorize / D1, so
-local queries hit your real Cloudflare resources.
-
-### Deploy
-
-```sh
-cd worker
-npm run deploy   # publishes to mcpdf.<your-subdomain>.workers.dev
-```
-
-### Auth
-
-If `MCP_AUTH_TOKEN` is set as a secret, the Worker requires
-`Authorization: Bearer <token>` on every `/mcp` request. If unset, `/mcp` is
-open — fine for a quick demo, not fine for a publicly-deployed Worker.
-
-```sh
-cd worker
-openssl rand -hex 32 | npx wrangler secret put MCP_AUTH_TOKEN
-```
-
-### Connect from claude.ai
-
-In claude.ai → Settings → Connectors → Add custom connector:
-
-- **URL**: `https://mcpdf.<your-subdomain>.workers.dev/mcp`
-- **Auth**: Bearer token; paste the value of `MCP_AUTH_TOKEN`.
-
-The four tools will appear in the connector's tool list.
-
-## Multiple corpora
-
-Each corpus is a fully independent (Vectorize index, D1 database, Worker URL)
-triple. The worker code is shared — additional corpora are deployed via
-`wrangler.toml` `[env.X]` blocks, with `wrangler deploy --env X`.
-
-To add a corpus called `mcpdf-music`:
-
-1. **Provision Cloudflare resources** for the new corpus:
+1. **Provision Cloudflare resources**:
 
    ```sh
-   cd worker
-   npx wrangler vectorize create mcpdf-music --dimensions=768 --metric=cosine
-   npx wrangler vectorize create-metadata-index mcpdf-music \
+   npx wrangler vectorize create studio --dimensions=768 --metric=cosine
+   npx wrangler vectorize create-metadata-index studio \
      --property-name=document_path --type=string
-   npx wrangler d1 create mcpdf-music   # note the printed UUID
+   npx wrangler d1 create studio          # note the printed UUID
+   ```
 
-   npx wrangler d1 execute mcpdf-music --remote --command "CREATE TABLE documents (
+   The metadata index is what makes `search`'s `document_path` filter fast.
+   Cheap to create up front, painful to backfill later.
+
+2. **Create the `documents` table**:
+
+   ```sh
+   npx wrangler d1 execute studio --remote --command "CREATE TABLE documents (
      path TEXT PRIMARY KEY,
      title TEXT NOT NULL,
      content_sha256 TEXT NOT NULL,
@@ -217,38 +164,55 @@ To add a corpus called `mcpdf-music`:
    );"
    ```
 
-2. **Add an `[env.music]` block to `wrangler.toml`** (copy the commented
-   `[env.example]` template at the bottom of the file and change `example` to
-   `music`, including the `database_id`). Bindings are not inherited from the
-   top-level config — every binding must be declared in the env block.
-
-3. **Set the auth secret for this env**:
-
-   ```sh
-   openssl rand -hex 32 | npx wrangler secret put MCP_AUTH_TOKEN --env music
-   ```
+3. **Add an `[env.studio]` block to `wrangler.toml`** (already present for
+   `studio`; copy the commented template at the bottom of the file for new
+   corpora and rename throughout). Paste the D1 UUID from step 1 into the
+   block's `database_id`. Bindings are not inherited from the top-level
+   config — every binding must be declared in the env block.
 
 4. **Deploy**:
 
    ```sh
-   npx wrangler deploy --env music
-   # → https://mcpdf-music.<your-subdomain>.workers.dev/mcp
+   npx wrangler deploy --env studio
+   # → https://studio.<your-subdomain>.workers.dev
+   curl https://studio.<your-subdomain>.workers.dev/healthz   # → ok
    ```
 
-5. **Upload PDFs to the corpus**:
+5. **Set the auth secret** (must be after first deploy):
 
    ```sh
-   uv run mcpdf-index extract /path/to/music-PDFs --out music.jsonl
-   uv run mcpdf-index upload music.jsonl --corpus mcpdf-music
+   openssl rand -hex 32 | tee /dev/tty | npx wrangler secret put MCP_AUTH_TOKEN --env studio
    ```
 
-6. **Add as a separate connector in claude.ai** with the new URL and its own
-   `MCP_AUTH_TOKEN`. The connector's name will read as `mcpdf-music` (the
-   `CORPUS_NAME` var from the env block).
+   `tee /dev/tty` prints the token so you can copy it for claude.ai before
+   piping it into wrangler. Without `MCP_AUTH_TOKEN` set, `/mcp` is open.
 
-The default top-level config in `wrangler.toml` deploys to `mcpdf` when you run
-`wrangler deploy` with no `--env`. Treat it as your primary corpus or remove it
-if every corpus should be explicitly named.
+6. **Upload PDFs**:
+
+   ```sh
+   cd ..   # back to repo root
+   uv run mcpdf-index extract /path/to/studio-PDFs --out studio.jsonl
+   uv run mcpdf-index upload studio.jsonl --corpus studio
+   ```
+
+7. **Add as a connector in claude.ai** — Settings → Connectors → Add custom
+   connector:
+
+   - **URL**: `https://studio.<your-subdomain>.workers.dev/mcp`
+   - **Auth**: Bearer; paste the value from step 5.
+
+   The connector's MCP server name will read as `studio` (the `CORPUS_NAME`
+   var from the env block).
+
+### Local dev
+
+```sh
+cd worker
+npx wrangler dev --env studio    # http://127.0.0.1:8787/healthz
+```
+
+`wrangler dev` uses remote bindings by default for AI / Vectorize / D1, so
+local queries hit your real Cloudflare resources.
 
 ## How it works
 
