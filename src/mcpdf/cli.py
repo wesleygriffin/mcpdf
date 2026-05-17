@@ -19,6 +19,12 @@ from .tokenizer import GemmaTokenizer
 log = logging.getLogger("mcpdf")
 
 
+# D1's REST API caps per-query bound params at 100 and per-statement SQL at
+# ~100KB. With 2 params per chunk row (vector_id, text), 40 chunks per batch
+# = 80 params with comfortable headroom on both axes.
+_CHUNKS_BATCH_SIZE = 40
+
+
 def _vector_id(document_path: str, version: str, chunk_index: int) -> str:
     """Stable per-(path, version, chunk_index) vector ID.
 
@@ -46,13 +52,21 @@ def _cmd_extract(args: argparse.Namespace) -> int:
         log.error("No PDFs found at %s", args.path)
         return 2
 
+    input_root = args.path.expanduser().resolve()
+    if args.absolute_paths:
+        rel_root: Path | None = None
+        log.info("Storing absolute document_path values")
+    else:
+        rel_root = input_root.parent if input_root.is_file() else input_root
+        log.info("Storing document_path values relative to %s", rel_root)
+
     log.info("Extracting %d PDF(s) into %s", len(paths), args.out)
     seen_docs: set[str] = set()
     chunk_count = 0
     failures: list[ExtractFailure] = []
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as f:
-        for item in extract_chunks(paths, tokenizer, cfg):
+        for item in extract_chunks(paths, tokenizer, cfg, path_relative_to=rel_root):
             if isinstance(item, ExtractFailure):
                 failures.append(item)
                 continue
@@ -91,6 +105,29 @@ def _group_by_doc(records: list[ChunkRecord]) -> dict[str, list[ChunkRecord]]:
     return groups
 
 
+async def _insert_chunk_rows(
+    client: CloudflareClient,
+    db_id: str,
+    rows: list[tuple[str, str]],
+) -> None:
+    """Multi-row UPSERT into `chunks`, batched to stay under D1's param cap."""
+    for i in range(0, len(rows), _CHUNKS_BATCH_SIZE):
+        batch = rows[i : i + _CHUNKS_BATCH_SIZE]
+        placeholders = ",".join("(?, ?)" for _ in batch)
+        params: list[object] = []
+        for vector_id, text in batch:
+            params.extend([vector_id, text])
+        await client.d1_query(
+            db_id,
+            f"""
+            INSERT INTO chunks (vector_id, text)
+            VALUES {placeholders}
+            ON CONFLICT(vector_id) DO UPDATE SET text = excluded.text
+            """,
+            params,
+        )
+
+
 async def _upload_one_doc(
     client: CloudflareClient,
     cfg: Config,
@@ -101,10 +138,11 @@ async def _upload_one_doc(
     version: str,
 ) -> None:
     doc = chunks[0]
+    new_count = len(chunks)
     log.info(
         "%s: %d chunks (%s, %d pages)%s",
         doc.document_title,
-        len(chunks),
+        new_count,
         doc.document_path,
         doc.document_total_pages,
         f" [version={version}]" if version else "",
@@ -112,15 +150,27 @@ async def _upload_one_doc(
     if dry_run:
         return
 
-    # Embed in batches and build Vectorize records.
+    # Look up previous chunk_count for this (path, version) so we can clean up
+    # ghost vectors+rows after a shrinkage re-upload.
+    prev = await client.d1_query(
+        db_id,
+        "SELECT chunk_count FROM documents WHERE path = ? AND version = ?",
+        [doc.document_path, version],
+    )
+    old_count = int(prev[0]["chunk_count"]) if prev else 0
+
+    # Embed in batches; build vector records (no text in metadata — that lives
+    # in the chunks table) and parallel chunk rows.
     vectors: list[dict] = []
-    for start in range(0, len(chunks), cfg.embed_batch_size):
+    chunk_rows: list[tuple[str, str]] = []
+    for start in range(0, new_count, cfg.embed_batch_size):
         batch = chunks[start : start + cfg.embed_batch_size]
         embeddings = await client.embed_batch(cfg.workers_ai_model, [c.text for c in batch])
         for c, vec in zip(batch, embeddings):
+            vid = _vector_id(c.document_path, version, c.chunk_index)
             vectors.append(
                 {
-                    "id": _vector_id(c.document_path, version, c.chunk_index),
+                    "id": vid,
                     "values": vec,
                     "metadata": {
                         "document_path": c.document_path,
@@ -129,11 +179,12 @@ async def _upload_one_doc(
                         "version": version,
                         "page_start": c.page_start,
                         "page_end": c.page_end,
-                        "text": c.text,
                     },
                 }
             )
+            chunk_rows.append((vid, c.text))
     await client.vectorize_insert(cfg.vectorize_index, vectors)
+    await _insert_chunk_rows(client, db_id, chunk_rows)
 
     # Upsert the documents row. Composite PK (path, version) lets multiple
     # versions of the same path coexist; re-uploading the same (path, version)
@@ -156,10 +207,33 @@ async def _upload_one_doc(
             doc.document_title,
             doc.document_sha256,
             doc.document_total_pages,
-            len(chunks),
+            new_count,
             time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         ],
     )
+
+    # Shrinkage cleanup: if this (path, version) used to have more chunks,
+    # the high-index IDs are now ghosts in both Vectorize and chunks.
+    if old_count > new_count:
+        ghost_ids = [
+            _vector_id(doc.document_path, version, i) for i in range(new_count, old_count)
+        ]
+        log.info(
+            "Cleaning up %d ghost chunks from previous upload (was %d, now %d)",
+            len(ghost_ids),
+            old_count,
+            new_count,
+        )
+        await client.vectorize_delete_by_ids(cfg.vectorize_index, ghost_ids)
+        # DELETE … WHERE id IN (?, ?, …) in batches under the 100-param cap.
+        for i in range(0, len(ghost_ids), 90):
+            batch_ids = ghost_ids[i : i + 90]
+            placeholders = ",".join("?" for _ in batch_ids)
+            await client.d1_query(
+                db_id,
+                f"DELETE FROM chunks WHERE vector_id IN ({placeholders})",
+                list(batch_ids),
+            )
 
 
 async def _amain_upload(args: argparse.Namespace) -> int:
@@ -212,6 +286,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--out", type=Path, default=Path("chunks.jsonl"), help="Output JSONL path"
     )
     p_extract.add_argument("--no-recursive", action="store_true")
+    p_extract.add_argument(
+        "--absolute-paths",
+        action="store_true",
+        help=(
+            "Store the full absolute filesystem path in each chunk's "
+            "document_path field. By default, paths are stored relative to "
+            "the input root (or just the basename if the input is a single "
+            "file). Don't mix relative and absolute paths in the same corpus — "
+            "they're treated as different documents."
+        ),
+    )
 
     p_upload = sub.add_parser(
         "upload", help="Embed chunks via Workers AI and insert into Vectorize + D1"

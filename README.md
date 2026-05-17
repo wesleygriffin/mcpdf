@@ -79,6 +79,13 @@ Each line of `chunks.jsonl` is one chunk with denormalized document metadata
 (title, sha, page range). No network calls are made beyond the one-time
 tokenizer download from Hugging Face.
 
+By default, each chunk's `document_path` is stored **relative to the input
+root** you passed (e.g. `cubase/v15/manual.pdf` rather than the full
+absolute path). Single-file inputs store just the basename. Pass
+`--absolute-paths` to keep the full filesystem path instead. Don't mix
+relative and absolute paths in the same corpus — they're treated as
+different documents.
+
 Defaults:
 
 | Env var | Default | Purpose |
@@ -169,7 +176,7 @@ cd worker
    later. (You can add a `document_sha256` metadata index too if you plan to
    filter on raw content hash; Vectorize allows up to 10 per index.)
 
-2. **Create the `documents` table**:
+2. **Create the D1 tables** — one for per-document metadata, one for per-chunk text:
 
    ```sh
    npx wrangler d1 execute studio --remote --command "CREATE TABLE documents (
@@ -181,12 +188,20 @@ cd worker
      chunk_count INTEGER NOT NULL,
      indexed_at TEXT NOT NULL,
      PRIMARY KEY (path, version)
+   );
+   CREATE TABLE chunks (
+     vector_id TEXT PRIMARY KEY,
+     text TEXT NOT NULL
    );"
    ```
 
-   `(path, version)` is a composite primary key — different versions of the
-   same path coexist as separate rows. The `version` column is `''` for
-   unversioned uploads (which is itself a distinct version, not "no row").
+   - **`documents`**: `(path, version)` is a composite PK — different versions
+     of the same path coexist as separate rows. The `version` column is `''`
+     for unversioned uploads (which is itself a distinct version, not "no row").
+   - **`chunks`**: holds the full chunk text, keyed by `vector_id`. Vectorize's
+     metadata cap (10KB per vector) is too small for big chunks; this table is
+     where the full text actually lives. The worker JOINs to it at search time
+     to populate the `text` field in hits.
 
 3. **Add an `[env.studio]` block to `wrangler.toml`** (already present for
    `studio`; copy the commented template at the bottom of the file for new
@@ -303,9 +318,13 @@ are the only way to get true isolation.
    `@cf/google/embeddinggemma-300m` via Workers AI. Output is 768-dim float
    vectors.
 4. **Store** — Vectors go into Vectorize keyed by
-   `sha256(path||\0||version)[:16]:<idx>` with per-chunk metadata (path, title,
-   document_sha256, version, page_start, page_end, text). One row per
-   `(path, version)` goes into D1's `documents` table.
-5. **Search (Worker-side, future)** — Worker receives an MCP `search` call,
-   embeds the query via Workers AI, queries Vectorize with `topK`, returns the
-   hits with metadata.
+   `sha256(path||\0||version)[:16]:<idx>` with small per-chunk metadata (path,
+   title, document_sha256, version, page_start, page_end). Full chunk text
+   goes into D1's `chunks` table keyed by the same vector_id. One row per
+   `(path, version)` goes into D1's `documents` table. Re-uploading a doc
+   with fewer chunks than before automatically cleans up the now-ghost
+   vectors and chunks rows at the high indices.
+5. **Search** — Worker receives an MCP `search` call, embeds the query via
+   Workers AI, queries Vectorize with `topK` (and any filters), then batches a
+   single `SELECT text FROM chunks WHERE vector_id IN (…)` to populate the
+   text on each hit before returning.

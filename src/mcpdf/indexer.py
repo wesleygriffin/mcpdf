@@ -42,7 +42,15 @@ def extract_chunks(
     paths: list[Path],
     tokenizer: GemmaTokenizer,
     cfg: Config,
+    *,
+    path_relative_to: Path | None = None,
 ) -> Iterator[ChunkRecord | ExtractFailure]:
+    """Emit ChunkRecords for each PDF.
+
+    `path_relative_to`: if set, each chunk's `document_path` is stored relative
+    to this directory (must be an absolute path). If None, absolute paths are
+    stored (the pre-normalization default).
+    """
     for path in paths:
         try:
             pdf = extract_pdf(path)
@@ -59,9 +67,14 @@ def extract_chunks(
         if not chunks:
             log.warning("No extractable text: %s", path)
             continue
+        document_path = (
+            str(pdf.path.relative_to(path_relative_to))
+            if path_relative_to is not None
+            else str(pdf.path)
+        )
         for idx, c in enumerate(chunks):
             yield ChunkRecord(
-                document_path=str(pdf.path),
+                document_path=document_path,
                 document_title=pdf.title,
                 document_sha256=pdf.content_sha256,
                 document_total_pages=pdf.total_pages,
