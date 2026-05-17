@@ -203,13 +203,23 @@ cd worker
      where the full text actually lives. The worker JOINs to it at search time
      to populate the `text` field in hits.
 
-3. **Add an `[env.studio]` block to `wrangler.toml`** (already present for
-   `studio`; copy the commented template at the bottom of the file for new
-   corpora and rename throughout). Paste the D1 UUID from step 1 into the
-   block's `database_id`. Bindings are not inherited from the top-level
-   config — every binding must be declared in the env block.
+3. **Provision the KV namespace for OAuth state**:
 
-4. **Deploy**:
+   ```sh
+   npx wrangler kv namespace create OAUTH_KV --env studio
+   ```
+
+   Paste the printed `id` into `wrangler.toml` at the
+   `[[env.studio.kv_namespaces]]` block, replacing
+   `REPLACE_WITH_WRANGLER_KV_NAMESPACE_CREATE_OUTPUT`.
+
+4. **Confirm `[env.studio]` block in `wrangler.toml`** (already present for
+   `studio`; copy the commented template at the bottom for new corpora and
+   rename throughout). Paste the D1 UUID from step 1 and the KV id from
+   step 3. Bindings are not inherited from the top-level config — every
+   binding must be declared in the env block.
+
+5. **Deploy**:
 
    ```sh
    npx wrangler deploy --env studio
@@ -217,16 +227,17 @@ cd worker
    curl https://studio.<your-subdomain>.workers.dev/healthz   # → ok
    ```
 
-5. **Set the auth secret** (must be after first deploy):
+6. **Set the shared password** (must be after first deploy):
 
    ```sh
-   openssl rand -hex 32 | tee /dev/tty | npx wrangler secret put MCP_AUTH_TOKEN --env studio
+   openssl rand -hex 24 | tee /dev/tty | npx wrangler secret put SHARED_PASSWORD --env studio
    ```
 
-   `tee /dev/tty` prints the token so you can copy it for claude.ai before
-   piping it into wrangler. Without `MCP_AUTH_TOKEN` set, `/mcp` is open.
+   `tee /dev/tty` prints the password to your terminal so you can save it
+   somewhere before piping it into wrangler. This is what you'll type at
+   the OAuth login page when you connect from claude.ai or Claude Desktop.
 
-6. **Upload PDFs**:
+7. **Upload PDFs**:
 
    ```sh
    cd ..   # back to repo root
@@ -234,14 +245,15 @@ cd worker
    uv run mcpdf-index upload studio.jsonl --corpus studio
    ```
 
-7. **Add as a connector in claude.ai** — Settings → Connectors → Add custom
-   connector:
+8. **Add as a connector in claude.ai or Claude Desktop** — Settings →
+   Connectors → Add custom connector. Just the URL:
 
    - **URL**: `https://studio.<your-subdomain>.workers.dev/mcp`
-   - **Auth**: Bearer; paste the value from step 5.
 
-   The connector's MCP server name will read as `studio` (the `CORPUS_NAME`
-   var from the env block).
+   The client will redirect you through the OAuth flow on first connect:
+   you'll land on the worker's login page, enter the password from step 6,
+   and be redirected back. The MCP server name will read as `studio` (the
+   `CORPUS_NAME` var from the env block).
 
 ### Local dev
 

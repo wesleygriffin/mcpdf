@@ -46,6 +46,13 @@ class_name = "McpdfAgent"
 tag = "v1"
 new_sqlite_classes = ["McpdfAgent"]
 
+# OAuth provider state (auth codes, tokens, registered clients).
+# Provision once with: wrangler kv namespace create OAUTH_KV --env studio
+# Paste the printed id below.
+[[env.studio.kv_namespaces]]
+binding = "OAUTH_KV"
+id = "35a696dee2024c7aa087c0f9d3370a4a"
+
 # Shown by claude.ai as the connector's server name.
 [env.studio.vars]
 CORPUS_NAME = "studio"
@@ -74,6 +81,10 @@ CORPUS_NAME = "studio"
 # [[env.rpg.migrations]]
 # tag = "v1"
 # new_sqlite_classes = ["McpdfAgent"]
+#
+# [[env.rpg.kv_namespaces]]
+# binding = "OAUTH_KV"
+# id = "REPLACE_WITH_WRANGLER_KV_NAMESPACE_CREATE_OUTPUT"
 #
 # [env.rpg.vars]
 # CORPUS_NAME = "rpg"

@@ -1,0 +1,150 @@
+# CLAUDE.md
+
+Project-specific guidance for future Claude Code sessions. Read alongside
+the global `~/.claude/CLAUDE.md` rules, not in place of them.
+
+## What this is
+
+A local PDF extractor + uploader paired with a Cloudflare Worker that
+exposes the resulting index as a remote MCP server.
+
+- `src/mcpdf/` — Python CLI (`mcpdf-index`). Extracts PDF text with
+  PyMuPDF, chunks against EmbeddingGemma's tokenizer (token counts match
+  Workers AI billing), pushes vectors + chunk text to Cloudflare.
+- `worker/` — TypeScript Cloudflare Worker using Cloudflare's `agents`
+  SDK (Streamable HTTP MCP transport). `McpdfAgent` runs as a SQLite-backed
+  Durable Object; exposes `search`, `list_documents`, `get_document_info`,
+  `remove_document`.
+
+Storage is split deliberately: Vectorize holds embeddings + a small slice of
+metadata for filtering only; D1 holds per-document rows (`documents`) and
+the full per-chunk text (`chunks`).
+
+## Core concepts
+
+### Corpus
+
+A **corpus** is the triple `(Vectorize index, D1 database, deployed Worker URL)`.
+All three share the same name (e.g., `studio`, `papers`). Each corpus is an
+independently deployed Worker — see "Multi-corpus model" below.
+
+### Document identity is `(path, version)`
+
+Not just `path`. v15 and v16 of the same path coexist as distinct documents.
+The `version` column is `''` when `--version` isn't passed at upload time —
+the unversioned entry is itself one distinct version, not "no row." SQLite
+composite PKs require every column `NOT NULL` because `NULL ≠ NULL` breaks
+`ON CONFLICT`.
+
+### Vector ID format is a wire contract
+
+`sha256(document_path || \x00 || version)[:16] : <chunk_index:05d>`
+
+Generated in `src/mcpdf/cli.py::_vector_id` and reconstructed in
+`worker/src/index.ts::chunkIds`. **Bit-identical across Python and Node** —
+verified. Don't change one side without the other, and don't change the
+format at all without re-uploading every existing corpus.
+
+## Multi-corpus model (wrangler.toml)
+
+- **No top-level corpus.** Every corpus is its own `[env.X]` block.
+  `wrangler deploy` without `--env <name>` deliberately errors (top-level
+  has no `name`) — this prevents accidental misconfigured deploys.
+- Bindings (AI / Vectorize / D1 / DO / migrations / vars) are **not
+  inherited** from top-level into env blocks. Each env block redeclares
+  everything. This is a wrangler design choice, not a bug.
+- `CORPUS_NAME` in each block becomes the `McpServer({ name: … })` value
+  so claude.ai shows distinct connector names per corpus.
+
+## D1 schema (per corpus)
+
+```sql
+CREATE TABLE documents (
+  path TEXT NOT NULL,
+  version TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  total_pages INTEGER NOT NULL,
+  chunk_count INTEGER NOT NULL,
+  indexed_at TEXT NOT NULL,
+  PRIMARY KEY (path, version)
+);
+
+CREATE TABLE chunks (
+  vector_id TEXT PRIMARY KEY,
+  text TEXT NOT NULL
+);
+```
+
+`chunks.text` is the source of truth for chunk text. Worker `search` does a
+batched `SELECT … WHERE vector_id IN (…)` after the Vectorize query. **Do
+not put chunk text back into Vectorize metadata** — the 10KB metadata cap
+won't hold 1500-token chunks (we burned a session learning this).
+
+## Hard limits we design around
+
+- **Vectorize metadata**: 10KB JSON per vector. Keep small — no text.
+- **D1 REST API**: 100 bound params per query, ~100KB SQL per statement.
+  Chunks insert batches at 40 rows (80 params); deletes at 90 IDs.
+- **EmbeddingGemma via Workers AI**: 768-dim vectors, 2048 max tokens per
+  input. HF-gated — license must be accepted at
+  <https://huggingface.co/google/embeddinggemma-300m>.
+- **Workers Free**: 10k Neurons/day will throttle a bulk re-embed; user is
+  on a paid plan.
+
+## Credentials
+
+Typical .env file.
+
+Required: `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `HF_TOKEN`.
+`MCP_AUTH_TOKEN` is per-Worker, set with
+`wrangler secret put MCP_AUTH_TOKEN --env <name>`.
+
+## Common commands
+
+Python (from repo root):
+```sh
+uv sync
+uv run ruff check src/mcpdf/
+uv run mcpdf-index extract <path> --out X.jsonl
+uv run mcpdf-index upload X.jsonl --corpus <name> [--version V]
+```
+
+Worker (from `worker/`):
+```sh
+npm run typecheck                                   # tsc --noEmit
+npx wrangler deploy --dry-run --env <name>          # validate config only
+npx wrangler deploy --env <name>                    # real deploy
+npx wrangler d1 execute <name> --remote --command   # ad-hoc SQL
+```
+
+There is no `npm run dev` or `npm run deploy` shortcut — they were footguns
+without `--env`. Use the `wrangler` commands directly.
+
+## Sharp edges
+
+- **`wrangler dev` uses remote bindings by default.** Local queries hit
+  real Vectorize/D1 unless you opt out. Don't extract+upload test PDFs
+  during local dev without realizing it.
+- **`path_relative_to`** in `extract_chunks` makes `document_path`
+  relative to the input root by default; `--absolute-paths` opts out.
+  **Don't mix relative and absolute paths in the same corpus** — composite
+  PK treats them as different documents.
+- **CWB attaches to existing workers** — must `wrangler deploy --env X`
+  once manually before the Builds tab appears in the dashboard.
+- **Worker preview deployments share bindings with prod** — never use
+  them for dev. Always a separate `[env.X]` block.
+- **Re-uploading a shrunk doc** automatically cleans up high-index ghost
+  vectors and chunks rows (the old-count > new-count branch in
+  `_upload_one_doc`). Don't remove that logic to "simplify" — it solves a
+  real correctness issue.
+
+## What's intentionally NOT here
+
+- **No tests yet** (Python or TS). Validation surface is `ruff check` +
+  `tsc --noEmit` + `wrangler deploy --dry-run`. Adding a test framework
+  would be welcome but not silently — discuss first.
+- **No CI YAML in the repo.** User chose Cloudflare Workers Builds
+  (dashboard-only) so the CI config isn't coupled to a specific git host.
+- **No git remote yet.** First commit hasn't been made; everything in
+  `git status` is uncommitted as of session handoff.

@@ -2,14 +2,19 @@
  * mcpdf Worker — remote MCP server for PDF search.
  *
  * Exposes four MCP tools backed by Workers AI (query embedding), Vectorize
- * (chunk vectors + metadata), and D1 (per-document rows). The local
- * `mcpdf-index upload` CLI populates Vectorize and D1; this Worker only
- * reads/deletes from them.
+ * (chunk vectors + metadata), and D1 (per-document metadata + per-chunk text).
+ * The local `mcpdf-index upload` CLI populates Vectorize and D1; this Worker
+ * only reads/deletes from them.
+ *
+ * Auth: OAuth 2.1 + PKCE via @cloudflare/workers-oauth-provider. Login is a
+ * shared-password form served by `defaultHandler` at /authorize; on match,
+ * we hand control back to the OAuth provider via completeAuthorization.
  *
  * Vector ID format MUST stay in sync with `src/mcpdf/cli.py::_vector_id`:
- *     `${sha256(path).slice(0,16)}:${chunkIndex.toString().padStart(5,'0')}`
+ *   sha256(path || \x00 || version).slice(0,16) : <chunk_index zero-padded to 5>
  */
 
+import OAuthProvider, { type AuthRequest, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { McpAgent } from "agents/mcp";
 import { z } from "zod";
@@ -19,12 +24,19 @@ export interface Env {
   VECTORIZE: Vectorize;
   DB: D1Database;
   MCP_OBJECT: DurableObjectNamespace<McpdfAgent>;
-  MCP_AUTH_TOKEN?: string;
+  OAUTH_KV: KVNamespace;
+  // Injected at runtime by OAuthProvider — not declared in wrangler.toml.
+  OAUTH_PROVIDER: OAuthHelpers;
+  SHARED_PASSWORD?: string;
   WORKERS_AI_EMBED_MODEL?: string;
   // Set per-corpus via `[vars]` in wrangler.toml. Shown by claude.ai as the
   // connector's MCP server name; useful for distinguishing corpora.
   CORPUS_NAME?: string;
 }
+
+// Props are stashed in the OAuth grant and exposed on the DO as `this.props`.
+// Single-user shared-password setup just stamps a fixed "owner" identity.
+type Props = { userId: string };
 
 interface DocumentRow {
   path: string;
@@ -47,7 +59,7 @@ interface ChunkMetadata {
 
 const DEFAULT_EMBED_MODEL = "@cf/google/embeddinggemma-300m";
 
-export class McpdfAgent extends McpAgent<Env> {
+export class McpdfAgent extends McpAgent<Env, Record<string, never>, Props> {
   server = new McpServer({
     name: this.env.CORPUS_NAME ?? "mcpdf",
     version: "0.1.0",
@@ -321,29 +333,13 @@ async function sha256Hex(input: string): Promise<string> {
     .join("");
 }
 
-function unauthorized(): Response {
-  return new Response("unauthorized\n", {
-    status: 401,
-    headers: {
-      "content-type": "text/plain; charset=utf-8",
-      "www-authenticate": 'Bearer realm="mcpdf"',
-    },
-  });
-}
-
-function checkAuth(request: Request, env: Env): Response | null {
-  if (!env.MCP_AUTH_TOKEN) return null;
-  const header = request.headers.get("authorization");
-  if (!header) return unauthorized();
-  const [scheme, token] = header.split(" ", 2);
-  if (scheme?.toLowerCase() !== "bearer" || token !== env.MCP_AUTH_TOKEN) {
-    return unauthorized();
-  }
-  return null;
-}
-
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+// Handles everything that isn't /mcp: /healthz, the login form at /authorize,
+// and 404 for everything else. The OAuth provider routes /mcp to apiHandler
+// (after auth validation) and /authorize, /token, /register, /.well-known/*
+// to itself — but it delegates the *user-facing* part of /authorize (the
+// login UX) to this defaultHandler.
+const defaultHandler = {
+  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === "/healthz") {
@@ -352,15 +348,124 @@ export default {
       });
     }
 
-    if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
-      const denied = checkAuth(request, env);
-      if (denied) return denied;
-      return McpdfAgent.serve("/mcp").fetch(request, env, ctx);
+    if (url.pathname !== "/authorize") {
+      return new Response("not found\n", {
+        status: 404,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
     }
 
-    return new Response("not found\n", {
-      status: 404,
-      headers: { "content-type": "text/plain; charset=utf-8" },
-    });
+    if (request.method === "GET") {
+      const oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+      if (!oauthReqInfo.clientId) {
+        return new Response("invalid OAuth request: missing client_id\n", { status: 400 });
+      }
+      const state = encodeState(oauthReqInfo);
+      return htmlResponse(loginPage(state, env.CORPUS_NAME ?? "mcpdf"));
+    }
+
+    if (request.method === "POST") {
+      const form = await request.formData();
+      const password = String(form.get("password") ?? "");
+      const state = String(form.get("state") ?? "");
+
+      if (!env.SHARED_PASSWORD) {
+        return new Response(
+          "server misconfigured: SHARED_PASSWORD secret is not set\n",
+          { status: 500 },
+        );
+      }
+      if (password !== env.SHARED_PASSWORD) {
+        return htmlResponse(
+          loginPage(state, env.CORPUS_NAME ?? "mcpdf", "Incorrect password."),
+          401,
+        );
+      }
+
+      let oauthReqInfo: AuthRequest;
+      try {
+        oauthReqInfo = decodeState(state);
+      } catch {
+        return new Response("invalid state\n", { status: 400 });
+      }
+
+      const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+        request: oauthReqInfo,
+        userId: "owner",
+        scope: oauthReqInfo.scope,
+        props: { userId: "owner" } satisfies Props,
+        metadata: {},
+      });
+      return Response.redirect(redirectTo, 302);
+    }
+
+    return new Response("method not allowed\n", { status: 405 });
   },
-} satisfies ExportedHandler<Env>;
+};
+
+function encodeState(req: AuthRequest): string {
+  return btoa(JSON.stringify(req));
+}
+function decodeState(s: string): AuthRequest {
+  return JSON.parse(atob(s)) as AuthRequest;
+}
+
+function htmlResponse(body: string, status = 200): Response {
+  return new Response(body, {
+    status,
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
+}
+
+function loginPage(state: string, corpusName: string, error?: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Sign in to ${escapeHtml(corpusName)}</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; max-width: 420px;
+           margin: 6rem auto; padding: 0 1.5rem; color: #222; }
+    h1 { margin: 0 0 0.25rem; font-size: 1.4rem; }
+    p.sub { margin: 0 0 2rem; color: #666; font-size: 0.9rem; }
+    label { display: block; font-size: 0.85rem; color: #555; margin-bottom: 0.3rem; }
+    input[type=password] { width: 100%; padding: 0.6rem; font-size: 1rem;
+           box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px;
+           margin-bottom: 1rem; }
+    button { padding: 0.6rem 1.4rem; font-size: 1rem; background: #222;
+             color: white; border: none; border-radius: 4px; cursor: pointer; }
+    .err { color: #c00; margin-bottom: 1rem; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <h1>Sign in</h1>
+  <p class="sub">mcpdf corpus: <code>${escapeHtml(corpusName)}</code></p>
+  ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
+  <form method="POST">
+    <label for="p">Password</label>
+    <input id="p" type="password" name="password" autofocus required autocomplete="current-password">
+    <input type="hidden" name="state" value="${escapeHtml(state)}">
+    <button type="submit">Sign in</button>
+  </form>
+</body>
+</html>`;
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+export default new OAuthProvider({
+  apiRoute: "/mcp",
+  apiHandler: McpdfAgent.serve("/mcp") as never,
+  defaultHandler: defaultHandler as never,
+  authorizeEndpoint: "/authorize",
+  tokenEndpoint: "/token",
+  clientRegistrationEndpoint: "/register",
+});
