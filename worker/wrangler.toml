@@ -36,7 +36,7 @@ index_name = "studio"
 [[env.studio.d1_databases]]
 binding = "DB"
 database_name = "studio"
-database_id = "REPLACE_WITH_WRANGLER_D1_CREATE_OUTPUT"
+database_id = "d4db684a-63b6-440a-b755-5c8f1cad5c26"
 
 [[env.studio.durable_objects.bindings]]
 name = "MCP_OBJECT"
