@@ -19,9 +19,17 @@ from .tokenizer import GemmaTokenizer
 log = logging.getLogger("mcpdf")
 
 
-def _vector_id(document_path: str, chunk_index: int) -> str:
-    """Stable per-(path, chunk_index) vector ID. Re-uploads upsert in place."""
-    h = hashlib.sha256(document_path.encode("utf-8")).hexdigest()[:16]
+def _vector_id(document_path: str, version: str, chunk_index: int) -> str:
+    """Stable per-(path, version, chunk_index) vector ID.
+
+    `version` is part of the document's identity: v15 and v16 of the same path
+    occupy disjoint ID spaces and coexist in the index. Re-uploading the same
+    (path, version) upserts in place. Pass version="" for unversioned uploads.
+    The \\x00 separator prevents path/version boundary collisions
+    (e.g. path="ab" v="c" vs path="abc" v="").
+    """
+    key = f"{document_path}\x00{version}".encode("utf-8")
+    h = hashlib.sha256(key).hexdigest()[:16]
     return f"{h}:{chunk_index:05d}"
 
 
@@ -90,14 +98,16 @@ async def _upload_one_doc(
     db_id: str,
     *,
     dry_run: bool,
+    version: str,
 ) -> None:
     doc = chunks[0]
     log.info(
-        "%s: %d chunks (%s, %d pages)",
+        "%s: %d chunks (%s, %d pages)%s",
         doc.document_title,
         len(chunks),
         doc.document_path,
         doc.document_total_pages,
+        f" [version={version}]" if version else "",
     )
     if dry_run:
         return
@@ -110,11 +120,13 @@ async def _upload_one_doc(
         for c, vec in zip(batch, embeddings):
             vectors.append(
                 {
-                    "id": _vector_id(c.document_path, c.chunk_index),
+                    "id": _vector_id(c.document_path, version, c.chunk_index),
                     "values": vec,
                     "metadata": {
                         "document_path": c.document_path,
                         "document_title": c.document_title,
+                        "document_sha256": c.document_sha256,
+                        "version": version,
                         "page_start": c.page_start,
                         "page_end": c.page_end,
                         "text": c.text,
@@ -123,13 +135,15 @@ async def _upload_one_doc(
             )
     await client.vectorize_insert(cfg.vectorize_index, vectors)
 
-    # Upsert the documents row. SQLite-flavored UPSERT — D1 is SQLite.
+    # Upsert the documents row. Composite PK (path, version) lets multiple
+    # versions of the same path coexist; re-uploading the same (path, version)
+    # upserts in place.
     await client.d1_query(
         db_id,
         """
-        INSERT INTO documents (path, title, content_sha256, total_pages, chunk_count, indexed_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(path) DO UPDATE SET
+        INSERT INTO documents (path, version, title, content_sha256, total_pages, chunk_count, indexed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(path, version) DO UPDATE SET
             title = excluded.title,
             content_sha256 = excluded.content_sha256,
             total_pages = excluded.total_pages,
@@ -138,6 +152,7 @@ async def _upload_one_doc(
         """,
         [
             doc.document_path,
+            version,
             doc.document_title,
             doc.document_sha256,
             doc.document_total_pages,
@@ -175,9 +190,12 @@ async def _amain_upload(args: argparse.Namespace) -> int:
         else:
             db_id = await client.d1_database_id_for_name(cfg.d1_database)
             log.info("Resolved D1 %s -> %s", cfg.d1_database, db_id)
+        version = args.version or ""
         for path, chunks in groups.items():
             try:
-                await _upload_one_doc(client, cfg, chunks, db_id, dry_run=args.dry_run)
+                await _upload_one_doc(
+                    client, cfg, chunks, db_id, dry_run=args.dry_run, version=version
+                )
             except CloudflareAPIError as exc:
                 log.error("FAIL %s: %s", path, exc)
                 return 1
@@ -207,6 +225,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "Corpus name. Sets the target Vectorize index and D1 database to "
             "this value (they must already exist; see README). Overrides "
             "VECTORIZE_INDEX and D1_DATABASE env vars. Default: mcpdf."
+        ),
+    )
+    p_upload.add_argument(
+        "--version",
+        type=str,
+        default=None,
+        help=(
+            "Optional version string. Part of the document's identity: "
+            "uploading the same path with different --version values lets both "
+            "coexist in the corpus (e.g. cubase_op_man.pdf v15 and v16). "
+            "Re-uploading the same (path, version) upserts in place. "
+            "Free-form string (e.g. '15', 'v1.2', '2026-Q2'). Omit to upload "
+            "as the 'unversioned' entry (which is itself a distinct version)."
         ),
     )
     p_upload.add_argument(

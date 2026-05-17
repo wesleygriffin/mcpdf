@@ -28,6 +28,7 @@ export interface Env {
 
 interface DocumentRow {
   path: string;
+  version: string;
   title: string;
   content_sha256: string;
   total_pages: number;
@@ -38,9 +39,11 @@ interface DocumentRow {
 interface ChunkMetadata {
   document_path?: string;
   document_title?: string;
+  document_sha256?: string;
   page_start?: number;
   page_end?: number;
   text?: string;
+  version?: string;
 }
 
 const DEFAULT_EMBED_MODEL = "@cf/google/embeddinggemma-300m";
@@ -57,7 +60,8 @@ export class McpdfAgent extends McpAgent<Env> {
       {
         description:
           "Semantic search over indexed PDF chunks. Returns the most relevant " +
-          "chunks with their document title, page range, and surrounding text.",
+          "chunks with their document title, page range, surrounding text, and " +
+          "version metadata (content sha + optional user tag).",
         inputSchema: {
           query: z.string().min(1).describe("Natural-language query to embed and match."),
           top_k: z
@@ -71,16 +75,34 @@ export class McpdfAgent extends McpAgent<Env> {
             .string()
             .optional()
             .describe("If set, restrict results to chunks from this document path."),
+          version: z
+            .string()
+            .optional()
+            .describe(
+              "If set, restrict results to chunks stamped with this user-tag version " +
+                "(the --version value at upload time).",
+            ),
+          document_sha256: z
+            .string()
+            .optional()
+            .describe(
+              "If set, restrict results to chunks from a document with this content " +
+                "SHA-256 (auto-tracked at extract time, independent of --version).",
+            ),
         },
       },
-      async ({ query, top_k, document_path }) => {
+      async ({ query, top_k, document_path, version, document_sha256 }) => {
         const embedding = await embedQuery(this.env, query);
         const queryOpts: VectorizeQueryOptions = {
           topK: top_k,
           returnMetadata: "all",
         };
-        if (document_path) {
-          queryOpts.filter = { document_path };
+        const filter: Record<string, string> = {};
+        if (document_path) filter.document_path = document_path;
+        if (version) filter.version = version;
+        if (document_sha256) filter.document_sha256 = document_sha256;
+        if (Object.keys(filter).length > 0) {
+          queryOpts.filter = filter as VectorizeVectorMetadataFilter;
         }
         const result = await this.env.VECTORIZE.query(embedding, queryOpts);
         const hits = result.matches.map((m) => {
@@ -90,6 +112,8 @@ export class McpdfAgent extends McpAgent<Env> {
             score: m.score,
             document_path: meta.document_path ?? null,
             document_title: meta.document_title ?? null,
+            document_sha256: meta.document_sha256 ?? null,
+            version: meta.version ?? null,
             page_start: meta.page_start ?? null,
             page_end: meta.page_end ?? null,
             text: meta.text ?? "",
@@ -104,13 +128,15 @@ export class McpdfAgent extends McpAgent<Env> {
     this.server.registerTool(
       "list_documents",
       {
-        description: "List every indexed document with title, page count, chunk count, and indexed timestamp.",
+        description:
+          "List every indexed (path, version) entry with title, page count, chunk count, " +
+          "and indexed timestamp. Multiple versions of the same path appear as separate rows.",
         inputSchema: {},
       },
       async () => {
         const { results } = await this.env.DB.prepare(
-          "SELECT path, title, content_sha256, total_pages, chunk_count, indexed_at " +
-            "FROM documents ORDER BY title COLLATE NOCASE",
+          "SELECT path, version, title, content_sha256, total_pages, chunk_count, indexed_at " +
+            "FROM documents ORDER BY title COLLATE NOCASE, version",
         ).all<DocumentRow>();
         return {
           content: [
@@ -123,25 +149,43 @@ export class McpdfAgent extends McpAgent<Env> {
     this.server.registerTool(
       "get_document_info",
       {
-        description: "Look up a single document's metadata by its indexed path.",
+        description:
+          "Look up document metadata by path. Returns every version of that path " +
+          "unless `version` is given, in which case returns just that one.",
         inputSchema: {
           path: z.string().min(1).describe("Document path as stored at upload time."),
+          version: z
+            .string()
+            .optional()
+            .describe(
+              "If set, return only the row for this version. Omit to return all versions.",
+            ),
         },
       },
-      async ({ path }) => {
-        const row = await this.env.DB.prepare(
-          "SELECT path, title, content_sha256, total_pages, chunk_count, indexed_at " +
-            "FROM documents WHERE path = ?",
-        )
-          .bind(path)
-          .first<DocumentRow>();
-        if (!row) {
-          return {
-            content: [{ type: "text", text: JSON.stringify({ found: false, path }) }],
-          };
-        }
+      async ({ path, version }) => {
+        const stmt =
+          version !== undefined
+            ? this.env.DB.prepare(
+                "SELECT path, version, title, content_sha256, total_pages, chunk_count, indexed_at " +
+                  "FROM documents WHERE path = ? AND version = ?",
+              ).bind(path, version)
+            : this.env.DB.prepare(
+                "SELECT path, version, title, content_sha256, total_pages, chunk_count, indexed_at " +
+                  "FROM documents WHERE path = ? ORDER BY version",
+              ).bind(path);
+        const { results } = await stmt.all<DocumentRow>();
+        const documents = results ?? [];
         return {
-          content: [{ type: "text", text: JSON.stringify({ found: true, document: row }, null, 2) }],
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { found: documents.length > 0, path, documents },
+                null,
+                2,
+              ),
+            },
+          ],
         };
       },
     );
@@ -150,32 +194,64 @@ export class McpdfAgent extends McpAgent<Env> {
       "remove_document",
       {
         description:
-          "Remove a document from the index: deletes all its chunk vectors from Vectorize " +
-          "and its row from D1. Idempotent (returns ok even if nothing was indexed).",
+          "Remove indexed content for a path. Without `version`, removes every version " +
+          "of the path (all D1 rows and all chunk vectors). With `version`, removes only " +
+          "that one. Idempotent (returns ok even if nothing was indexed).",
         inputSchema: {
           path: z.string().min(1).describe("Document path as stored at upload time."),
+          version: z
+            .string()
+            .optional()
+            .describe(
+              "If set, remove only this version. Omit to remove every version of the path.",
+            ),
         },
       },
-      async ({ path }) => {
-        const row = await this.env.DB.prepare(
-          "SELECT chunk_count FROM documents WHERE path = ?",
-        )
-          .bind(path)
-          .first<{ chunk_count: number }>();
-        if (!row) {
+      async ({ path, version }) => {
+        const stmt =
+          version !== undefined
+            ? this.env.DB.prepare(
+                "SELECT version, chunk_count FROM documents WHERE path = ? AND version = ?",
+              ).bind(path, version)
+            : this.env.DB.prepare(
+                "SELECT version, chunk_count FROM documents WHERE path = ?",
+              ).bind(path);
+        const { results } = await stmt.all<{ version: string; chunk_count: number }>();
+        const rows = results ?? [];
+        if (rows.length === 0) {
           return {
-            content: [{ type: "text", text: JSON.stringify({ removed: false, path, reason: "not_indexed" }) }],
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ removed: false, path, version, reason: "not_indexed" }),
+              },
+            ],
           };
         }
-        const ids = await chunkIds(path, row.chunk_count);
-        await this.env.VECTORIZE.deleteByIds(ids);
-        await this.env.DB.prepare("DELETE FROM documents WHERE path = ?").bind(path).run();
+        let totalIds = 0;
+        for (const row of rows) {
+          const ids = await chunkIds(path, row.version, row.chunk_count);
+          await this.env.VECTORIZE.deleteByIds(ids);
+          totalIds += ids.length;
+        }
+        if (version !== undefined) {
+          await this.env.DB.prepare("DELETE FROM documents WHERE path = ? AND version = ?")
+            .bind(path, version)
+            .run();
+        } else {
+          await this.env.DB.prepare("DELETE FROM documents WHERE path = ?").bind(path).run();
+        }
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify(
-                { removed: true, path, vectors_deleted: ids.length },
+                {
+                  removed: true,
+                  path,
+                  versions_removed: rows.map((r) => r.version),
+                  vectors_deleted: totalIds,
+                },
                 null,
                 2,
               ),
@@ -199,8 +275,11 @@ async function embedQuery(env: Env, text: string): Promise<number[]> {
   return vec;
 }
 
-async function chunkIds(path: string, chunkCount: number): Promise<string[]> {
-  const prefix = await sha256Hex(path).then((h) => h.slice(0, 16));
+async function chunkIds(path: string, version: string, chunkCount: number): Promise<string[]> {
+  // Must match src/mcpdf/cli.py::_vector_id — `path\x00version` keyed sha,
+  // first 16 hex chars, then `:<chunk_index:05d>`.
+  const key = `${path}\x00${version}`;
+  const prefix = await sha256Hex(key).then((h) => h.slice(0, 16));
   const ids: string[] = [];
   for (let i = 0; i < chunkCount; i++) {
     ids.push(`${prefix}:${i.toString().padStart(5, "0")}`);

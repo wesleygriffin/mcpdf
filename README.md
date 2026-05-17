@@ -102,13 +102,27 @@ uv run mcpdf-index upload chunks.jsonl
 
 # Send to a non-default corpus (Vectorize index + D1 database must already exist):
 uv run mcpdf-index upload chunks.jsonl --corpus mcpdf-music
+
+# Stamp every uploaded vector + D1 row with a per-document version:
+uv run mcpdf-index upload chunks.jsonl --corpus studio --version 15
 ```
 
 `--corpus NAME` overrides both `VECTORIZE_INDEX` and `D1_DATABASE` — the
 convention is that one name labels both. The default is `mcpdf`.
 
-Vector IDs are derived as `sha256(path)[:16]:<chunk_index>`, so re-uploading the
-same file upserts in place. The D1 `documents` row is upserted by path.
+`--version VERSION` is **part of the document's identity**, not a tag —
+uploading the same path with two different versions creates two coexisting
+entries (e.g. `cubase_op_man.pdf --version 15` and then
+`cubase_op_man.pdf --version 16`, both searchable). Re-uploading the same
+`(path, version)` upserts in place. Omit `--version` to upload as the
+'unversioned' entry, which is itself a distinct version. Independent of
+this, every vector also carries `document_sha256` (the content hash from
+extract time) — automatic, not overridable, useful for change detection
+within a single version.
+
+Vector IDs are derived as `sha256(path||\0||version)[:16]:<chunk_index>`, so
+each `(path, version)` occupies its own ID space. The D1 `documents` row is
+upserted by `(path, version)`.
 
 ## Worker (`worker/`)
 
@@ -117,10 +131,10 @@ clients like claude.ai:
 
 | Tool | What it does |
 | --- | --- |
-| `search` | Embeds the query via Workers AI, runs `topK` Vectorize lookup, returns hits with text + page range. Optional `document_path` filter. |
-| `list_documents` | Returns every row from D1's `documents` table. |
-| `get_document_info` | Single-row lookup by `path`. |
-| `remove_document` | Deletes the doc's row from D1 and all its chunk vectors from Vectorize. |
+| `search` | Embeds the query via Workers AI, runs `topK` Vectorize lookup, returns hits with text, page range, content sha, and version. Optional filters: `document_path`, `version`, `document_sha256`. |
+| `list_documents` | Returns every `(path, version)` row from D1's `documents` table. Multiple versions of the same path appear as separate rows. |
+| `get_document_info` | Returns every version of `path`, or just one if `version` is given. |
+| `remove_document` | Without `version`, removes every version of `path`. With `version`, removes only that one. |
 
 The MCP endpoint is `/mcp` (Streamable HTTP). `/healthz` returns `ok` for
 uptime checks. The agent runs as a SQLite-backed Durable Object — one
@@ -145,24 +159,34 @@ cd worker
    npx wrangler vectorize create studio --dimensions=768 --metric=cosine
    npx wrangler vectorize create-metadata-index studio \
      --property-name=document_path --type=string
+   npx wrangler vectorize create-metadata-index studio \
+     --property-name=version --type=string
    npx wrangler d1 create studio          # note the printed UUID
    ```
 
-   The metadata index is what makes `search`'s `document_path` filter fast.
-   Cheap to create up front, painful to backfill later.
+   The metadata indexes are what make `search`'s `document_path` and
+   `version` filters fast. Cheap to create up front, painful to backfill
+   later. (You can add a `document_sha256` metadata index too if you plan to
+   filter on raw content hash; Vectorize allows up to 10 per index.)
 
 2. **Create the `documents` table**:
 
    ```sh
    npx wrangler d1 execute studio --remote --command "CREATE TABLE documents (
-     path TEXT PRIMARY KEY,
+     path TEXT NOT NULL,
+     version TEXT NOT NULL DEFAULT '',
      title TEXT NOT NULL,
      content_sha256 TEXT NOT NULL,
      total_pages INTEGER NOT NULL,
      chunk_count INTEGER NOT NULL,
-     indexed_at TEXT NOT NULL
+     indexed_at TEXT NOT NULL,
+     PRIMARY KEY (path, version)
    );"
    ```
+
+   `(path, version)` is a composite primary key — different versions of the
+   same path coexist as separate rows. The `version` column is `''` for
+   unversioned uploads (which is itself a distinct version, not "no row").
 
 3. **Add an `[env.studio]` block to `wrangler.toml`** (already present for
    `studio`; copy the commented template at the bottom of the file for new
@@ -225,9 +249,10 @@ local queries hit your real Cloudflare resources.
 3. **Embed (upload-side)** — Chunks are batched and sent to
    `@cf/google/embeddinggemma-300m` via Workers AI. Output is 768-dim float
    vectors.
-4. **Store** — Vectors go into Vectorize keyed by `sha256(path)[:16]:<idx>` with
-   per-chunk metadata (path, title, page_start, page_end, text). Per-document
-   rows go into D1's `documents` table.
+4. **Store** — Vectors go into Vectorize keyed by
+   `sha256(path||\0||version)[:16]:<idx>` with per-chunk metadata (path, title,
+   document_sha256, version, page_start, page_end, text). One row per
+   `(path, version)` goes into D1's `documents` table.
 5. **Search (Worker-side, future)** — Worker receives an MCP `search` call,
    embeds the query via Workers AI, queries Vectorize with `topK`, returns the
    hits with metadata.
