@@ -60,6 +60,16 @@ class CloudflareClient:
         )
         return _unwrap(resp)
 
+    async def vectorize_delete_by_ids(self, index_name: str, ids: list[str]) -> dict:
+        """Delete vectors by ID from a Vectorize index."""
+        if not ids:
+            return {}
+        resp = await self._client.post(
+            f"/vectorize/v2/indexes/{index_name}/delete_by_ids",
+            json={"ids": ids},
+        )
+        return _unwrap(resp)
+
     async def d1_query(
         self, database_id: str, sql: str, params: list[Any] | None = None
     ) -> list[dict[str, Any]]:
