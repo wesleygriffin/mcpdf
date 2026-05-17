@@ -238,6 +238,59 @@ npx wrangler dev --env studio    # http://127.0.0.1:8787/healthz
 `wrangler dev` uses remote bindings by default for AI / Vectorize / D1, so
 local queries hit your real Cloudflare resources.
 
+## Development
+
+### Continuous deployment (Cloudflare Workers Builds)
+
+Once a corpus's worker has been deployed once manually, you can wire it to
+push-to-deploy via **Cloudflare Workers Builds** (CWB). CWB is configured in
+the Cloudflare dashboard (no workflow YAML in the repo), so the CI config is
+not tied to a specific git provider — switch between GitHub and GitLab by
+reconnecting in the dashboard.
+
+The pattern is **one Worker per environment, each with its own CWB
+connection and branch filter**. For the production `studio` corpus:
+
+1. Cloudflare dashboard → Workers & Pages → `studio` → Settings →
+   **Builds** → **Connect**.
+2. Authorize the git provider, pick the `mcpdf` repo.
+3. Configure:
+   - **Branch**: `main`
+   - **Root directory**: `worker` (wrangler.toml lives here, not at the
+     repo root)
+   - **Build command**: `npm ci`
+   - **Deploy command**: `npx wrangler deploy --env studio`
+4. Save. Pushes to `main` will now build and deploy automatically.
+
+`MCP_AUTH_TOKEN` and other Worker secrets persist across deploys — no need
+to re-set them.
+
+### Dev/prod separation
+
+To iterate on worker code without risking the live corpus, add a second
+worker (e.g. `studio-dev`):
+
+1. Add an `[env.studio-dev]` block to `wrangler.toml` (copy `[env.studio]`,
+   rename throughout). Provision its own Vectorize index, D1 database, and
+   `documents` table — see [Adding a corpus](#adding-a-corpus). Use a small
+   set of test PDFs; the dev corpus doesn't need real data.
+2. Deploy it once manually: `npx wrangler deploy --env studio-dev`. CWB
+   attaches to existing deployed workers — the Builds tab only appears
+   after the first deploy.
+3. In the `studio-dev` worker's Builds settings, configure:
+   - **Branch**: any pattern that excludes `main` (e.g. `!main` or a
+     specific `dev` branch)
+   - **Deploy command**: `npx wrangler deploy --env studio-dev`
+
+Now main pushes deploy prod (`studio`); feature-branch pushes deploy dev
+(`studio-dev`). The two workers have entirely separate URLs, Vectorize
+indexes, D1 databases, and auth tokens.
+
+**Don't try to use Workers' built-in preview deployments for this.**
+Previews share bindings with the production worker, which means a dev query
+would hit your real `studio` D1 and Vectorize. Separate `[env.X]` blocks
+are the only way to get true isolation.
+
 ## How it works
 
 1. **Extract** — PyMuPDF reads each PDF page-by-page, preserving page numbers.
