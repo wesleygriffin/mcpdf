@@ -42,7 +42,6 @@ interface ChunkMetadata {
   document_sha256?: string;
   page_start?: number;
   page_end?: number;
-  text?: string;
   version?: string;
 }
 
@@ -105,6 +104,10 @@ export class McpdfAgent extends McpAgent<Env> {
           queryOpts.filter = filter as VectorizeVectorMetadataFilter;
         }
         const result = await this.env.VECTORIZE.query(embedding, queryOpts);
+        const textById = await fetchChunkText(
+          this.env,
+          result.matches.map((m) => m.id),
+        );
         const hits = result.matches.map((m) => {
           const meta = (m.metadata ?? {}) as ChunkMetadata;
           return {
@@ -116,7 +119,7 @@ export class McpdfAgent extends McpAgent<Env> {
             version: meta.version ?? null,
             page_start: meta.page_start ?? null,
             page_end: meta.page_end ?? null,
-            text: meta.text ?? "",
+            text: textById.get(m.id) ?? "",
           };
         });
         return {
@@ -229,10 +232,22 @@ export class McpdfAgent extends McpAgent<Env> {
           };
         }
         let totalIds = 0;
+        const allIds: string[] = [];
         for (const row of rows) {
           const ids = await chunkIds(path, row.version, row.chunk_count);
           await this.env.VECTORIZE.deleteByIds(ids);
+          allIds.push(...ids);
           totalIds += ids.length;
+        }
+        // Delete from chunks table in batches under D1's 100-param cap.
+        for (let i = 0; i < allIds.length; i += 90) {
+          const batch = allIds.slice(i, i + 90);
+          const placeholders = batch.map(() => "?").join(",");
+          await this.env.DB.prepare(
+            `DELETE FROM chunks WHERE vector_id IN (${placeholders})`,
+          )
+            .bind(...batch)
+            .run();
         }
         if (version !== undefined) {
           await this.env.DB.prepare("DELETE FROM documents WHERE path = ? AND version = ?")
@@ -261,6 +276,17 @@ export class McpdfAgent extends McpAgent<Env> {
       },
     );
   }
+}
+
+async function fetchChunkText(env: Env, ids: string[]): Promise<Map<string, string>> {
+  if (ids.length === 0) return new Map();
+  const placeholders = ids.map(() => "?").join(",");
+  const { results } = await env.DB.prepare(
+    `SELECT vector_id, text FROM chunks WHERE vector_id IN (${placeholders})`,
+  )
+    .bind(...ids)
+    .all<{ vector_id: string; text: string }>();
+  return new Map((results ?? []).map((r) => [r.vector_id, r.text]));
 }
 
 async function embedQuery(env: Env, text: string): Promise<number[]> {
