@@ -20,6 +20,13 @@ Storage is split deliberately: Vectorize holds embeddings + a small slice of
 metadata for filtering only; D1 holds per-document rows (`documents`) and
 the full per-chunk text (`chunks`).
 
+Auth: OAuth 2.1 + PKCE via `@cloudflare/workers-oauth-provider`, with the
+worker hosting `/authorize`, `/token`, `/register`, and the well-known
+discovery docs. A small shared-password login form (in `defaultHandler`
+inside `worker/src/index.ts`) gates the OAuth grant. Per-corpus state
+(client registrations, auth codes, tokens) lives in a per-env KV namespace
+bound as `OAUTH_KV`.
+
 ## Core concepts
 
 ### Corpus
@@ -94,11 +101,20 @@ won't hold 1500-token chunks (we burned a session learning this).
 
 ## Credentials
 
-Typical .env file.
+CLI loads from a typical `.env` file. Required:
+`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `HF_TOKEN`.
 
-Required: `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `HF_TOKEN`.
-`MCP_AUTH_TOKEN` is per-Worker, set with
-`wrangler secret put MCP_AUTH_TOKEN --env <name>`.
+Per-corpus Worker secrets (set with `wrangler secret put NAME --env <name>`):
+
+- `SHARED_PASSWORD` — what users type at the OAuth login page. There's no
+  username/identity model beyond "anyone who knows the password is `owner`."
+  Rotate by re-setting the secret; existing OAuth tokens stay valid (they
+  don't re-check the password) but new logins need the new value.
+
+`MCP_AUTH_TOKEN` is **no longer used** — the previous bearer-auth model was
+replaced by the OAuth flow when we switched to claude.ai/Desktop's
+OAuth-only connector UI. Safe to delete with
+`wrangler secret delete MCP_AUTH_TOKEN --env <name>` if it's still set.
 
 ## Common commands
 
@@ -138,6 +154,20 @@ without `--env`. Use the `wrangler` commands directly.
   vectors and chunks rows (the old-count > new-count branch in
   `_upload_one_doc`). Don't remove that logic to "simplify" — it solves a
   real correctness issue.
+- **Wrangler binding changes don't take effect until a redeploy.** Editing
+  `wrangler.toml` (e.g. pasting a real KV id over a placeholder) updates
+  the *next* deploy's bindings; the live worker keeps the bindings it had
+  at its last deploy. Symptom is usually a runtime `TypeError: Cannot read
+  properties of undefined (reading 'get')` from inside whatever package
+  expected `env.X`.
+- **Don't fill in `client_id` / `client_secret` in claude.ai's connector
+  UI.** Our worker advertises `/register` (dynamic client registration),
+  so claude.ai/Desktop registers itself silently on first contact. The
+  fields are escape hatches for OAuth servers that pre-issue static
+  credentials; filling them with arbitrary values breaks the lookup.
+- **The OAuth `defaultHandler` is the only place a user sees branded UX**
+  (the login page). Keep it minimal; if you ever add a logo, copy, or
+  per-corpus styling, do it there. The MCP traffic itself never renders.
 
 ## What's intentionally NOT here
 

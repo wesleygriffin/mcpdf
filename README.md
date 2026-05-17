@@ -289,8 +289,10 @@ connection and branch filter**. For the production `studio` corpus:
    - **Deploy command**: `npx wrangler deploy --env studio`
 4. Save. Pushes to `main` will now build and deploy automatically.
 
-`MCP_AUTH_TOKEN` and other Worker secrets persist across deploys — no need
-to re-set them.
+`SHARED_PASSWORD` and other Worker secrets persist across deploys — no need
+to re-set them. KV namespace and D1 bindings are also re-attached on each
+deploy from `wrangler.toml`, so changes to those bindings *do* require a
+redeploy to take effect.
 
 ### Dev/prod separation
 
