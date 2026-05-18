@@ -22,15 +22,17 @@ the full per-chunk text (`chunks`).
 
 Auth: OAuth 2.1 + PKCE via `@cloudflare/workers-oauth-provider`, with the
 worker hosting `/authorize`, `/token`, `/register`, and the well-known
-discovery docs. Login is a magic-link flow (in `defaultHandler` inside
-`worker/src/index.ts`): `POST /authorize` stores the OAuth `AuthRequest`
-under `magic:<uuid>` in `OAUTH_KV` (10 min TTL) and emails a single-use
-sign-in link via Cloudflare's `send_email` binding; `GET /authorize/verify`
-deletes the KV entry (burn-on-use) and hands control back to the OAuth
-provider via `completeAuthorization`. Per-corpus state (client
-registrations, auth codes, tokens, magic tokens) all live in a per-env KV
-namespace bound as `OAUTH_KV` — internal OAuth keys and our `magic:` keys
-don't collide.
+discovery docs. User authentication for `/authorize` is delegated to
+**Cloudflare Access** — a self-hosted Access application gates the
+`/authorize` path at the edge, and `defaultHandler` (in
+`worker/src/index.ts`) trusts the `Cf-Access-Authenticated-User-Email`
+header Access injects, optionally cross-checks it against `OWNER_EMAIL`,
+and immediately calls `completeAuthorization`. No browser UI in the
+worker; no email, no token. PKCE on the OAuth side keeps the
+no-consent-button flow safe — codes go to the registered `redirect_uri`
+and only redeem with the verifier the legitimate client generated.
+Per-corpus OAuth state (registrations, auth codes, tokens) lives in a
+per-env KV namespace bound as `OAUTH_KV`.
 
 ## Core concepts
 
@@ -109,33 +111,37 @@ won't hold 1500-token chunks (we burned a session learning this).
 CLI loads from a typical `.env` file. Required:
 `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `HF_TOKEN`.
 
-Per-corpus Worker configuration lives in `[env.<name>.vars]` and
-`[[env.<name>.send_email]]` blocks in `wrangler.toml` (not secrets — none
-of these are sensitive on their own, and putting them in vars makes
-`wrangler.toml` the single source of truth):
+Per-corpus Worker configuration lives in `[env.<name>.vars]` in
+`wrangler.toml` (not secrets — none of these are sensitive):
 
-- `OWNER_EMAIL` — recipient of sign-in links. **Must equal the
-  `destination_address`** on the `send_email` binding (Cloudflare enforces
-  the allowlist at the runtime layer) and must be a verified Email Routing
-  destination on a domain bound to the account.
-- `MAIL_FROM` — sender address for sign-in emails. Must live on a domain
-  this account controls. No per-address verification needed beyond owning
-  the domain.
-- `CORPUS_NAME` — display name used by `McpServer({ name })` and the
-  login page header.
+- `CORPUS_NAME` — display name used by `McpServer({ name })`.
+- `OWNER_EMAIL` — defense-in-depth check against the Access-injected
+  email header. Access already enforces the policy at the edge; this
+  guards against an over-broad Access policy ever being deployed. Leave
+  unset to trust whatever identity Access lets through.
 
-There is no shared password and no identity model beyond "anyone who can
-read `OWNER_EMAIL`'s inbox is `owner`." Rotate access by changing
-`OWNER_EMAIL` + the binding's `destination_address` together and
-redeploying — existing OAuth tokens stay valid (they don't re-check the
-recipient) but new sign-ins go to the new address.
+The Access app itself is configured **outside** this repo in the
+Cloudflare Zero Trust dashboard:
 
-`SHARED_PASSWORD` and `MCP_AUTH_TOKEN` are **both no longer used** —
-shared-password gating was replaced by magic-link, and the earlier
-bearer-auth model was replaced by OAuth when claude.ai/Desktop went
-OAuth-only. Safe to remove from any corpus that still has them:
-`wrangler secret delete SHARED_PASSWORD --env <name>` /
-`wrangler secret delete MCP_AUTH_TOKEN --env <name>`.
+1. Zero Trust → Access → Applications → Add application → Self-hosted.
+2. Application Domain: the worker host (e.g.
+   `studio.fraktured.workers.dev`). **Path: `/authorize` only** — do not
+   gate the whole hostname. `/register`, `/token`, `/.well-known/oauth-*`,
+   and `/mcp` are reached by claude.ai server-to-server and must remain
+   reachable without an Access session.
+3. Policy: Allow → Include → Emails → the owner address.
+4. Identity provider: whatever's configured for the account (Google /
+   GitHub SSO recommended; one-time PIN if you don't want federation).
+
+The worker fails closed: if `Cf-Access-Authenticated-User-Email` is
+missing, `/authorize` returns 403 with a message pointing at the Access
+misconfiguration.
+
+`SHARED_PASSWORD`, `MAIL_FROM`, the `send_email` binding, and the
+magic-link `/authorize/verify` route are all gone in the Access world.
+Stale secrets are safe to delete: `wrangler secret delete SHARED_PASSWORD
+--env <name>` (and `wrangler secret delete MCP_AUTH_TOKEN --env <name>`
+if it's still around from the pre-OAuth bearer-token era).
 
 ## Common commands
 
@@ -186,16 +192,31 @@ without `--env`. Use the `wrangler` commands directly.
   so claude.ai/Desktop registers itself silently on first contact. The
   fields are escape hatches for OAuth servers that pre-issue static
   credentials; filling them with arbitrary values breaks the lookup.
-- **The OAuth `defaultHandler` is the only place a user sees branded UX**
-  (the magic-link request page, the "check your inbox" page, and the
-  "link expired" page). Keep it minimal; if you ever add a logo, copy, or
-  per-corpus styling, do it there. The MCP traffic itself never renders.
-- **Magic-link tokens share `OAUTH_KV` with the OAuth provider's own
-  state**, under the `magic:<uuid>` prefix. The library's keys are
-  namespaced (`grant:`, `token:`, `client:`), so no collision. If you ever
-  want to wipe just our magic tokens without disturbing OAuth state, you
-  can scan `magic:` keys; conversely, blowing away `OAUTH_KV` wholesale
-  invalidates both magic tokens *and* every issued OAuth credential.
+- **The worker never renders branded UX anymore.** `defaultHandler` is
+  pure machinery: header check → `completeAuthorization` → 303. The only
+  HTML/UX a user sees during sign-in is Cloudflare Access's login page;
+  customize there if you want a logo or custom copy.
+- **Access app path scoping is load-bearing.** The Access policy MUST be
+  scoped to `/authorize` only. Gating the whole hostname (or any of
+  `/register`, `/token`, `/.well-known/oauth-*`, `/mcp`) breaks dynamic
+  client registration immediately — claude.ai is a server-side OAuth
+  client and has no Access session to present.
+- **Header trust is safe because workers have no separate origin.** All
+  traffic reaches a worker via Cloudflare's edge, and the edge strips
+  inbound `Cf-Access-*` headers and re-injects them only after Access
+  validates. Spoofing requires bypassing the edge, which isn't possible
+  for `*.workers.dev`. If we ever front a worker with a custom origin or
+  multi-cloud routing, upgrade to validating the `Cf-Access-Jwt-Assertion`
+  JWT instead of trusting the email header.
+- **CWB deploy command MUST include `--env <name>`.** A bare
+  `npx wrangler deploy` succeeds against our config (CWB passes the
+  worker name implicitly) but deploys *with every env-scoped binding
+  stripped* — the live worker ends up with code but no KV/D1/Vectorize/AI
+  attached. Symptom: runtime `TypeError: Cannot read properties of
+  undefined (reading 'put')` from inside the OAuth library at
+  `handleClientRegistration` (it hardcodes `env.OAUTH_KV.put`). Fix is in
+  the dashboard, not the code: Workers & Pages → worker → Settings →
+  Builds → Deploy command.
 
 ## What's intentionally NOT here
 

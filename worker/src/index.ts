@@ -6,21 +6,22 @@
  * The local `mcpdf-index upload` CLI populates Vectorize and D1; this Worker
  * only reads/deletes from them.
  *
- * Auth: OAuth 2.1 + PKCE via @cloudflare/workers-oauth-provider. Login is a
- * magic-link flow served by `defaultHandler`: POST /authorize stores the
- * OAuth AuthRequest under `magic:<uuid>` in OAUTH_KV and emails a sign-in
- * link via Cloudflare's send_email binding; GET /authorize/verify consumes
- * the token (single-use, KV-delete-before-complete) and hands control back
- * to the OAuth provider via completeAuthorization.
+ * Auth: OAuth 2.1 + PKCE via @cloudflare/workers-oauth-provider, with the
+ * user-authentication step delegated to Cloudflare Access. `defaultHandler`
+ * trusts the `Cf-Access-Authenticated-User-Email` header injected by the
+ * edge after Access validates, optionally cross-checks against OWNER_EMAIL,
+ * and immediately calls completeAuthorization. The Access application MUST
+ * be scoped to /authorize only — /register, /token, /.well-known/oauth-*,
+ * and /mcp are reached by claude.ai server-to-server and cannot live behind
+ * a browser-based gate.
  *
  * Vector ID format MUST stay in sync with `src/mcpdf/cli.py::_vector_id`:
  *   sha256(path || \x00 || version).slice(0,16) : <chunk_index zero-padded to 5>
  */
 
-import OAuthProvider, { type AuthRequest, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
+import OAuthProvider, { type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { McpAgent } from "agents/mcp";
-import { EmailMessage } from "cloudflare:email";
 import { z } from "zod";
 
 export interface Env {
@@ -31,25 +32,22 @@ export interface Env {
   OAUTH_KV: KVNamespace;
   // Injected at runtime by OAuthProvider — not declared in wrangler.toml.
   OAUTH_PROVIDER: OAuthHelpers;
-  // Cloudflare send_email binding. `destination_address` in wrangler.toml
-  // restricts what `to` we can pass; must include OWNER_EMAIL.
-  SEND_EMAIL: SendEmail;
   WORKERS_AI_EMBED_MODEL?: string;
   // Set per-corpus via `[vars]` in wrangler.toml. Shown by claude.ai as the
   // connector's MCP server name; useful for distinguishing corpora.
   CORPUS_NAME?: string;
-  // Recipient for sign-in links. Must be a verified Email Routing destination
-  // on a domain bound to this account, and must match the send_email
-  // binding's destination_address.
+  // Defense-in-depth check against the Cf-Access-Authenticated-User-Email
+  // header. Access already enforces the policy at the edge; this guards
+  // against an over-broad policy ever being deployed. Optional — leave unset
+  // to trust whatever identity Access lets through.
   OWNER_EMAIL?: string;
-  // Sender for sign-in emails. Must live on a domain this account controls.
-  MAIL_FROM?: string;
 }
 
-const MAGIC_TTL_SEC = 600;
+const ACCESS_EMAIL_HEADER = "cf-access-authenticated-user-email";
 
 // Props are stashed in the OAuth grant and exposed on the DO as `this.props`.
-// Single-user shared-password setup just stamps a fixed "owner" identity.
+// Stamps the Access-authenticated email so future tools can see which
+// identity opened the session.
 type Props = { userId: string };
 
 interface DocumentRow {
@@ -347,11 +345,13 @@ async function sha256Hex(input: string): Promise<string> {
     .join("");
 }
 
-// Handles everything that isn't /mcp: /healthz, the login UX at /authorize
-// and /authorize/verify, and 404 for everything else. The OAuth provider
-// routes /mcp to apiHandler (after auth validation) and /authorize, /token,
-// /register, /.well-known/* to itself — but it delegates the *user-facing*
-// part of /authorize (login) to this defaultHandler.
+// Handles /healthz and /authorize (delegated to us by the OAuth provider).
+// The /authorize handler trusts the Cf-Access-Authenticated-User-Email
+// header injected by the Cloudflare edge after Access validates the user,
+// then immediately completes the OAuth authorization. PKCE on the OAuth
+// side keeps this safe even without an explicit consent click — the code
+// the library issues goes to the client's registered redirect_uri and is
+// only redeemable with the verifier the legitimate client generated.
 const defaultHandler = {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -362,251 +362,45 @@ const defaultHandler = {
       });
     }
 
-    if (url.pathname === "/authorize/verify" && request.method === "GET") {
-      return handleVerify(request, env, url);
-    }
-
-    if (url.pathname !== "/authorize") {
+    if (url.pathname !== "/authorize" || request.method !== "GET") {
       return new Response("not found\n", {
         status: 404,
         headers: { "content-type": "text/plain; charset=utf-8" },
       });
     }
 
-    const corpus = env.CORPUS_NAME ?? "mcpdf";
-
-    if (request.method === "GET") {
-      const oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-      if (!oauthReqInfo.clientId) {
-        return new Response("invalid OAuth request: missing client_id\n", { status: 400 });
-      }
-      if (!env.OWNER_EMAIL) {
-        return new Response(
-          "server misconfigured: OWNER_EMAIL var is not set\n",
-          { status: 500 },
-        );
-      }
-      const state = encodeState(oauthReqInfo);
-      return htmlResponse(requestLinkPage(state, corpus, maskEmail(env.OWNER_EMAIL)));
+    const accessEmail = request.headers.get(ACCESS_EMAIL_HEADER);
+    if (!accessEmail) {
+      // Hard-fail closed: Access isn't in front of /authorize. Without this
+      // guard, anyone on the public internet could complete the OAuth flow
+      // and mint a token. The fix is a Cloudflare Access self-hosted app
+      // scoped to <worker-host>/authorize, not a code change.
+      return new Response(
+        "forbidden: Cloudflare Access must be configured for /authorize\n",
+        { status: 403, headers: { "content-type": "text/plain; charset=utf-8" } },
+      );
+    }
+    if (env.OWNER_EMAIL && accessEmail !== env.OWNER_EMAIL) {
+      return new Response("forbidden: not owner\n", { status: 403 });
     }
 
-    if (request.method === "POST") {
-      if (!env.OWNER_EMAIL || !env.MAIL_FROM) {
-        return new Response(
-          "server misconfigured: OWNER_EMAIL or MAIL_FROM var is not set\n",
-          { status: 500 },
-        );
-      }
-
-      const form = await request.formData();
-      const stateStr = String(form.get("state") ?? "");
-      let oauthReqInfo: AuthRequest;
-      try {
-        oauthReqInfo = decodeState(stateStr);
-      } catch {
-        return new Response("invalid state\n", { status: 400 });
-      }
-
-      const token = crypto.randomUUID();
-      await env.OAUTH_KV.put(magicKey(token), JSON.stringify(oauthReqInfo), {
-        expirationTtl: MAGIC_TTL_SEC,
-      });
-      const verifyUrl = new URL("/authorize/verify", url);
-      verifyUrl.searchParams.set("token", token);
-
-      try {
-        await sendMagicLink(env, verifyUrl.toString(), corpus);
-      } catch (err) {
-        // Best-effort cleanup so the unused token doesn't sit in KV.
-        await env.OAUTH_KV.delete(magicKey(token));
-        const msg = err instanceof Error ? err.message : String(err);
-        return new Response(`failed to send email: ${msg}\n`, { status: 502 });
-      }
-
-      return htmlResponse(linkSentPage(corpus, maskEmail(env.OWNER_EMAIL)));
+    const oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+    if (!oauthReqInfo.clientId) {
+      return new Response("invalid OAuth request: missing client_id\n", { status: 400 });
     }
 
-    return new Response("method not allowed\n", { status: 405 });
+    const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+      request: oauthReqInfo,
+      userId: accessEmail,
+      scope: oauthReqInfo.scope,
+      props: { userId: accessEmail } satisfies Props,
+      metadata: {},
+    });
+    // 303 so the OAuth client's callback (registered redirect_uri) is
+    // followed with GET regardless of how this request arrived.
+    return Response.redirect(redirectTo, 303);
   },
 };
-
-async function handleVerify(request: Request, env: Env, url: URL): Promise<Response> {
-  const token = url.searchParams.get("token");
-  if (!token) return new Response("missing token\n", { status: 400 });
-
-  const key = magicKey(token);
-  const stored = await env.OAUTH_KV.get(key);
-  // Single-use: delete before completing so a refresh / re-click can't
-  // re-grant. KV TTL is the freshness fence; this is the burn-on-use fence.
-  await env.OAUTH_KV.delete(key);
-  if (!stored) {
-    return htmlResponse(
-      messagePage(
-        env.CORPUS_NAME ?? "mcpdf",
-        "Link expired or already used",
-        "Sign-in links expire after 10 minutes and can only be used once. Restart the connection from your client to get a new one.",
-      ),
-      410,
-    );
-  }
-
-  let oauthReqInfo: AuthRequest;
-  try {
-    oauthReqInfo = JSON.parse(stored) as AuthRequest;
-  } catch {
-    return new Response("invalid stored state\n", { status: 500 });
-  }
-
-  const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
-    request: oauthReqInfo,
-    userId: "owner",
-    scope: oauthReqInfo.scope,
-    props: { userId: "owner" } satisfies Props,
-    metadata: {},
-  });
-  // Use a 303 so the client follows with GET (the redirect target is the
-  // OAuth client's callback URL, which expects GET).
-  return Response.redirect(redirectTo, 303);
-}
-
-async function sendMagicLink(env: Env, verifyUrl: string, corpus: string): Promise<void> {
-  const from = env.MAIL_FROM!;
-  const to = env.OWNER_EMAIL!;
-  const subject = `Sign in to ${corpus}`;
-  const body = [
-    `Click the link below to sign in to the "${corpus}" mcpdf connector.`,
-    ``,
-    verifyUrl,
-    ``,
-    `This link is single-use and expires in ${Math.round(MAGIC_TTL_SEC / 60)} minutes.`,
-    `If you didn't request it, you can ignore this email.`,
-  ].join("\r\n");
-
-  const raw = buildMimeMessage({ from, to, subject, body });
-  await env.SEND_EMAIL.send(new EmailMessage(from, to, raw));
-}
-
-function buildMimeMessage(opts: {
-  from: string;
-  to: string;
-  subject: string;
-  body: string;
-}): string {
-  // RFC 5322 wants CRLF; Cloudflare's send_email validator is strict about it.
-  const domain = opts.from.split("@")[1] ?? "localhost";
-  const messageId = `<${crypto.randomUUID()}@${domain}>`;
-  const headers = [
-    `From: ${opts.from}`,
-    `To: ${opts.to}`,
-    `Subject: ${opts.subject}`,
-    `Message-ID: ${messageId}`,
-    `Date: ${new Date().toUTCString()}`,
-    `MIME-Version: 1.0`,
-    `Content-Type: text/plain; charset=utf-8`,
-    `Content-Transfer-Encoding: 7bit`,
-  ];
-  return headers.join("\r\n") + "\r\n\r\n" + opts.body + "\r\n";
-}
-
-function magicKey(token: string): string {
-  return `magic:${token}`;
-}
-
-function maskEmail(addr: string): string {
-  const [local, domain] = addr.split("@");
-  if (!local || !domain) return addr;
-  const head = local.length > 1 ? local[0] : local;
-  return `${head}***@${domain}`;
-}
-
-function encodeState(req: AuthRequest): string {
-  return btoa(JSON.stringify(req));
-}
-function decodeState(s: string): AuthRequest {
-  return JSON.parse(atob(s)) as AuthRequest;
-}
-
-function htmlResponse(body: string, status = 200): Response {
-  return new Response(body, {
-    status,
-    headers: { "content-type": "text/html; charset=utf-8" },
-  });
-}
-
-const pageStyles = `
-    body { font-family: system-ui, -apple-system, sans-serif; max-width: 420px;
-           margin: 6rem auto; padding: 0 1.5rem; color: #222; }
-    h1 { margin: 0 0 0.25rem; font-size: 1.4rem; }
-    p.sub { margin: 0 0 1.5rem; color: #666; font-size: 0.9rem; }
-    p { line-height: 1.5; }
-    button { padding: 0.6rem 1.4rem; font-size: 1rem; background: #222;
-             color: white; border: none; border-radius: 4px; cursor: pointer; }
-    code { background: #f3f3f3; padding: 0.1rem 0.3rem; border-radius: 3px; }
-`;
-
-function requestLinkPage(state: string, corpusName: string, maskedTo: string): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Sign in to ${escapeHtml(corpusName)}</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>${pageStyles}</style>
-</head>
-<body>
-  <h1>Sign in</h1>
-  <p class="sub">mcpdf corpus: <code>${escapeHtml(corpusName)}</code></p>
-  <p>We'll email a single-use sign-in link to <code>${escapeHtml(maskedTo)}</code>. The link expires in 10 minutes.</p>
-  <form method="POST">
-    <input type="hidden" name="state" value="${escapeHtml(state)}">
-    <button type="submit">Email me a sign-in link</button>
-  </form>
-</body>
-</html>`;
-}
-
-function linkSentPage(corpusName: string, maskedTo: string): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Check your inbox — ${escapeHtml(corpusName)}</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>${pageStyles}</style>
-</head>
-<body>
-  <h1>Check your inbox</h1>
-  <p class="sub">mcpdf corpus: <code>${escapeHtml(corpusName)}</code></p>
-  <p>We sent a sign-in link to <code>${escapeHtml(maskedTo)}</code>. Open it in this browser to finish connecting. You can close this tab.</p>
-</body>
-</html>`;
-}
-
-function messagePage(corpusName: string, title: string, body: string): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>${escapeHtml(title)} — ${escapeHtml(corpusName)}</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>${pageStyles}</style>
-</head>
-<body>
-  <h1>${escapeHtml(title)}</h1>
-  <p class="sub">mcpdf corpus: <code>${escapeHtml(corpusName)}</code></p>
-  <p>${escapeHtml(body)}</p>
-</body>
-</html>`;
-}
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
 
 export default new OAuthProvider({
   apiRoute: "/mcp",

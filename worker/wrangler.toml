@@ -46,30 +46,21 @@ class_name = "McpdfAgent"
 tag = "v1"
 new_sqlite_classes = ["McpdfAgent"]
 
-# OAuth provider state (auth codes, tokens, registered clients) AND
-# single-use magic-link tokens (`magic:<uuid>` keys with 10 min TTL).
+# OAuth provider state: registered clients, auth codes, and access tokens.
 # Provision once with: wrangler kv namespace create OAUTH_KV --env studio
 # Paste the printed id below.
 [[env.studio.kv_namespaces]]
 binding = "OAUTH_KV"
 id = "35a696dee2024c7aa087c0f9d3370a4a"
 
-# Cloudflare Send Email binding for magic-link auth. `destination_address`
-# must be a verified Email Routing destination on a domain bound to this
-# account, and must match `OWNER_EMAIL` below — Cloudflare enforces the
-# allowlist at the runtime layer.
-[[env.studio.send_email]]
-name = "SEND_EMAIL"
-destination_address = "wgriffin@fraktured.net"
-
+# Auth is handled by Cloudflare Access (Zero Trust → Applications). Create
+# a self-hosted application matching `<worker-host>/authorize` with a
+# policy that allows only OWNER_EMAIL below. The worker reads the
+# `Cf-Access-Authenticated-User-Email` header that Access injects and
+# fails closed (403) if the header is missing.
 [env.studio.vars]
-# Shown by claude.ai as the connector's server name.
 CORPUS_NAME = "studio"
-# Recipient for sign-in links. Must match destination_address above.
 OWNER_EMAIL = "wgriffin@fraktured.net"
-# Sender for sign-in emails. Must live on a domain this account controls
-# (no verification needed for the From address itself, only the destination).
-MAIL_FROM = "wgriffin@fraktured.net"
 
 # === template — copy this whole block, change every "rpg" ===
 #
@@ -100,11 +91,6 @@ MAIL_FROM = "wgriffin@fraktured.net"
 # binding = "OAUTH_KV"
 # id = "REPLACE_WITH_WRANGLER_KV_NAMESPACE_CREATE_OUTPUT"
 #
-# [[env.rpg.send_email]]
-# name = "SEND_EMAIL"
-# destination_address = "you@example.com"
-#
 # [env.rpg.vars]
 # CORPUS_NAME = "rpg"
 # OWNER_EMAIL = "you@example.com"
-# MAIL_FROM = "noreply@example.com"

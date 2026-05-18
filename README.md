@@ -227,30 +227,32 @@ cd worker
    curl https://studio.<your-subdomain>.workers.dev/healthz   # → ok
    ```
 
-6. **Configure magic-link auth.** The corpus is gated by a magic link
-   emailed to a single verified address — there's no shared password.
-   Prereqs (one-time per Cloudflare account, not per corpus):
+6. **Gate `/authorize` with Cloudflare Access.** Auth is handled by Zero
+   Trust at the edge — no shared password, no email loop. In the
+   Cloudflare dashboard → Zero Trust → Access → Applications → Add an
+   application → Self-hosted:
 
-   - A domain bound to this account with **Email Routing** enabled.
-   - The destination address (e.g. `you@example.com`) verified through the
-     Email Routing UI.
+   - **Application Domain**: the worker host (e.g.
+     `studio.fraktured.workers.dev`).
+   - **Path**: `/authorize` — *only*. Do NOT gate the whole hostname or
+     any of `/register`, `/token`, `/.well-known/oauth-*`, `/mcp`. Those
+     are reached by claude.ai server-to-server and have no Access session.
+   - **Identity providers**: whatever you have configured (Google or
+     GitHub SSO recommended — one click and a persistent session).
+   - **Policy**: Allow → Include → Emails → your owner address.
 
-   Then update the corpus's block in `wrangler.toml` so all three of these
-   point at the same recipient:
+   Then set `OWNER_EMAIL` in `wrangler.toml` to the same address as a
+   defense-in-depth check (the worker rejects sessions whose Access email
+   doesn't match):
 
    ```toml
-   [[env.studio.send_email]]
-   name = "SEND_EMAIL"
-   destination_address = "you@example.com"
-
    [env.studio.vars]
-   CORPUS_NAME    = "studio"
-   OWNER_EMAIL    = "you@example.com"      # must match destination_address
-   MAIL_FROM      = "noreply@example.com"  # any address on a domain you control
+   CORPUS_NAME = "studio"
+   OWNER_EMAIL = "you@example.com"
    ```
 
-   No secrets to set — these aren't sensitive on their own, and Cloudflare
-   enforces the `destination_address` allowlist at the runtime layer.
+   No secrets to set. The worker fails closed (403) if Access isn't in
+   front when it should be.
 
 7. **Upload PDFs**:
 
@@ -265,11 +267,12 @@ cd worker
 
    - **URL**: `https://studio.<your-subdomain>.workers.dev/mcp`
 
-   The client will redirect you through the OAuth flow on first connect:
-   you'll land on the worker's sign-in page, click **Email me a sign-in
-   link**, then open the link from your inbox (single-use, expires in 10
-   minutes). The MCP server name will read as `studio` (the `CORPUS_NAME`
-   var from the env block).
+   The client will redirect you through the OAuth flow on first connect.
+   If you're already logged in to Access (via the identity provider you
+   configured), the entire `/authorize` step is invisible — the browser
+   bounces through and back to claude.ai. If you're not logged in, you'll
+   see the Access login page once. The MCP server name will read as
+   `studio` (the `CORPUS_NAME` var from the env block).
 
 ### Local dev
 
