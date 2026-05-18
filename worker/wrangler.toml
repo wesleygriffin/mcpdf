@@ -69,7 +69,7 @@ CORPUS_NAME = "studio"
 OWNER_EMAIL = "wgriffin@fraktured.net"
 # Sender for sign-in emails. Must live on a domain this account controls
 # (no verification needed for the From address itself, only the destination).
-MAIL_FROM = "noreply@fraktured.net"
+MAIL_FROM = "wgriffin@fraktured.net"
 
 # === template — copy this whole block, change every "rpg" ===
 #
