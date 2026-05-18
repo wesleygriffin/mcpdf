@@ -22,10 +22,15 @@ the full per-chunk text (`chunks`).
 
 Auth: OAuth 2.1 + PKCE via `@cloudflare/workers-oauth-provider`, with the
 worker hosting `/authorize`, `/token`, `/register`, and the well-known
-discovery docs. A small shared-password login form (in `defaultHandler`
-inside `worker/src/index.ts`) gates the OAuth grant. Per-corpus state
-(client registrations, auth codes, tokens) lives in a per-env KV namespace
-bound as `OAUTH_KV`.
+discovery docs. Login is a magic-link flow (in `defaultHandler` inside
+`worker/src/index.ts`): `POST /authorize` stores the OAuth `AuthRequest`
+under `magic:<uuid>` in `OAUTH_KV` (10 min TTL) and emails a single-use
+sign-in link via Cloudflare's `send_email` binding; `GET /authorize/verify`
+deletes the KV entry (burn-on-use) and hands control back to the OAuth
+provider via `completeAuthorization`. Per-corpus state (client
+registrations, auth codes, tokens, magic tokens) all live in a per-env KV
+namespace bound as `OAUTH_KV` — internal OAuth keys and our `magic:` keys
+don't collide.
 
 ## Core concepts
 
@@ -104,17 +109,33 @@ won't hold 1500-token chunks (we burned a session learning this).
 CLI loads from a typical `.env` file. Required:
 `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `HF_TOKEN`.
 
-Per-corpus Worker secrets (set with `wrangler secret put NAME --env <name>`):
+Per-corpus Worker configuration lives in `[env.<name>.vars]` and
+`[[env.<name>.send_email]]` blocks in `wrangler.toml` (not secrets — none
+of these are sensitive on their own, and putting them in vars makes
+`wrangler.toml` the single source of truth):
 
-- `SHARED_PASSWORD` — what users type at the OAuth login page. There's no
-  username/identity model beyond "anyone who knows the password is `owner`."
-  Rotate by re-setting the secret; existing OAuth tokens stay valid (they
-  don't re-check the password) but new logins need the new value.
+- `OWNER_EMAIL` — recipient of sign-in links. **Must equal the
+  `destination_address`** on the `send_email` binding (Cloudflare enforces
+  the allowlist at the runtime layer) and must be a verified Email Routing
+  destination on a domain bound to the account.
+- `MAIL_FROM` — sender address for sign-in emails. Must live on a domain
+  this account controls. No per-address verification needed beyond owning
+  the domain.
+- `CORPUS_NAME` — display name used by `McpServer({ name })` and the
+  login page header.
 
-`MCP_AUTH_TOKEN` is **no longer used** — the previous bearer-auth model was
-replaced by the OAuth flow when we switched to claude.ai/Desktop's
-OAuth-only connector UI. Safe to delete with
-`wrangler secret delete MCP_AUTH_TOKEN --env <name>` if it's still set.
+There is no shared password and no identity model beyond "anyone who can
+read `OWNER_EMAIL`'s inbox is `owner`." Rotate access by changing
+`OWNER_EMAIL` + the binding's `destination_address` together and
+redeploying — existing OAuth tokens stay valid (they don't re-check the
+recipient) but new sign-ins go to the new address.
+
+`SHARED_PASSWORD` and `MCP_AUTH_TOKEN` are **both no longer used** —
+shared-password gating was replaced by magic-link, and the earlier
+bearer-auth model was replaced by OAuth when claude.ai/Desktop went
+OAuth-only. Safe to remove from any corpus that still has them:
+`wrangler secret delete SHARED_PASSWORD --env <name>` /
+`wrangler secret delete MCP_AUTH_TOKEN --env <name>`.
 
 ## Common commands
 
@@ -166,8 +187,15 @@ without `--env`. Use the `wrangler` commands directly.
   fields are escape hatches for OAuth servers that pre-issue static
   credentials; filling them with arbitrary values breaks the lookup.
 - **The OAuth `defaultHandler` is the only place a user sees branded UX**
-  (the login page). Keep it minimal; if you ever add a logo, copy, or
+  (the magic-link request page, the "check your inbox" page, and the
+  "link expired" page). Keep it minimal; if you ever add a logo, copy, or
   per-corpus styling, do it there. The MCP traffic itself never renders.
+- **Magic-link tokens share `OAUTH_KV` with the OAuth provider's own
+  state**, under the `magic:<uuid>` prefix. The library's keys are
+  namespaced (`grant:`, `token:`, `client:`), so no collision. If you ever
+  want to wipe just our magic tokens without disturbing OAuth state, you
+  can scan `magic:` keys; conversely, blowing away `OAUTH_KV` wholesale
+  invalidates both magic tokens *and* every issued OAuth credential.
 
 ## What's intentionally NOT here
 

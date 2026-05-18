@@ -16,7 +16,6 @@ def _load_env_once() -> None:
     candidates: list[Path] = []
     if env_path := os.environ.get("MCPDF_ENV_FILE"):
         candidates.append(Path(env_path).expanduser())
-    candidates.append(Path("~/Source/mm-env").expanduser())
     candidates.append(Path(".env"))
     for path in candidates:
         if path.exists():
@@ -36,7 +35,6 @@ class Config:
     # Cloudflare (required for upload, optional for extract)
     cf_account_id: str | None
     cf_api_token: str | None
-    cf_workers_subdomain: str | None
     vectorize_index: str
     d1_database: str
     workers_ai_model: str
@@ -61,7 +59,6 @@ class Config:
         return cls(
             cf_account_id=os.getenv("CLOUDFLARE_ACCOUNT_ID"),
             cf_api_token=os.getenv("CLOUDFLARE_API_TOKEN"),
-            cf_workers_subdomain=os.getenv("CLOUDFLARE_WORKERS_SUBDOMAIN"),
             vectorize_index=corpus or os.getenv("VECTORIZE_INDEX", "mcpdf"),
             d1_database=corpus or os.getenv("D1_DATABASE", "mcpdf"),
             workers_ai_model=os.getenv("WORKERS_AI_MODEL", "@cf/google/embeddinggemma-300m"),

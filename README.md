@@ -227,15 +227,30 @@ cd worker
    curl https://studio.<your-subdomain>.workers.dev/healthz   # → ok
    ```
 
-6. **Set the shared password** (must be after first deploy):
+6. **Configure magic-link auth.** The corpus is gated by a magic link
+   emailed to a single verified address — there's no shared password.
+   Prereqs (one-time per Cloudflare account, not per corpus):
 
-   ```sh
-   openssl rand -hex 24 | tee /dev/tty | npx wrangler secret put SHARED_PASSWORD --env studio
+   - A domain bound to this account with **Email Routing** enabled.
+   - The destination address (e.g. `you@example.com`) verified through the
+     Email Routing UI.
+
+   Then update the corpus's block in `wrangler.toml` so all three of these
+   point at the same recipient:
+
+   ```toml
+   [[env.studio.send_email]]
+   name = "SEND_EMAIL"
+   destination_address = "you@example.com"
+
+   [env.studio.vars]
+   CORPUS_NAME    = "studio"
+   OWNER_EMAIL    = "you@example.com"      # must match destination_address
+   MAIL_FROM      = "noreply@example.com"  # any address on a domain you control
    ```
 
-   `tee /dev/tty` prints the password to your terminal so you can save it
-   somewhere before piping it into wrangler. This is what you'll type at
-   the OAuth login page when you connect from claude.ai or Claude Desktop.
+   No secrets to set — these aren't sensitive on their own, and Cloudflare
+   enforces the `destination_address` allowlist at the runtime layer.
 
 7. **Upload PDFs**:
 
@@ -251,9 +266,10 @@ cd worker
    - **URL**: `https://studio.<your-subdomain>.workers.dev/mcp`
 
    The client will redirect you through the OAuth flow on first connect:
-   you'll land on the worker's login page, enter the password from step 6,
-   and be redirected back. The MCP server name will read as `studio` (the
-   `CORPUS_NAME` var from the env block).
+   you'll land on the worker's sign-in page, click **Email me a sign-in
+   link**, then open the link from your inbox (single-use, expires in 10
+   minutes). The MCP server name will read as `studio` (the `CORPUS_NAME`
+   var from the env block).
 
 ### Local dev
 
@@ -289,10 +305,10 @@ connection and branch filter**. For the production `studio` corpus:
    - **Deploy command**: `npx wrangler deploy --env studio`
 4. Save. Pushes to `main` will now build and deploy automatically.
 
-`SHARED_PASSWORD` and other Worker secrets persist across deploys — no need
-to re-set them. KV namespace and D1 bindings are also re-attached on each
-deploy from `wrangler.toml`, so changes to those bindings *do* require a
-redeploy to take effect.
+Worker secrets persist across deploys — no need to re-set them. KV
+namespace, D1, and `send_email` bindings are re-attached on each deploy
+from `wrangler.toml`, so changes to those bindings (including the
+`destination_address` allowlist) *do* require a redeploy to take effect.
 
 ### Dev/prod separation
 
