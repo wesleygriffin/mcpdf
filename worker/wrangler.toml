@@ -21,8 +21,8 @@ compatibility_flags = ["nodejs_compat"]
 [observability]
 enabled = true
 
-# === studio ===
 
+# === studio ===
 [env.studio]
 name = "studio"
 
@@ -46,51 +46,43 @@ class_name = "McpdfAgent"
 tag = "v1"
 new_sqlite_classes = ["McpdfAgent"]
 
-# OAuth provider state: registered clients, auth codes, and access tokens.
-# Provision once with: wrangler kv namespace create OAUTH_KV --env studio
-# Paste the printed id below.
 [[env.studio.kv_namespaces]]
 binding = "OAUTH_KV"
 id = "35a696dee2024c7aa087c0f9d3370a4a"
 
-# Auth is handled by Cloudflare Access (Zero Trust → Applications). Create
-# a self-hosted application matching `<worker-host>/authorize` with a
-# policy that allows only OWNER_EMAIL below. The worker reads the
-# `Cf-Access-Authenticated-User-Email` header that Access injects and
-# fails closed (403) if the header is missing.
 [env.studio.vars]
 CORPUS_NAME = "studio"
 OWNER_EMAIL = "wgriffin@fraktured.net"
 
-# === template — copy this whole block, change every "rpg" ===
-#
-# [env.rpg]
-# name = "rpg"
-#
-# [env.rpg.ai]
-# binding = "AI"
-#
-# [[env.rpg.vectorize]]
-# binding = "VECTORIZE"
-# index_name = "rpg"
-#
-# [[env.rpg.d1_databases]]
-# binding = "DB"
-# database_name = "rpg"
-# database_id = "REPLACE_WITH_WRANGLER_D1_CREATE_OUTPUT"
-#
-# [[env.rpg.durable_objects.bindings]]
-# name = "MCP_OBJECT"
-# class_name = "McpdfAgent"
-#
-# [[env.rpg.migrations]]
-# tag = "v1"
-# new_sqlite_classes = ["McpdfAgent"]
-#
-# [[env.rpg.kv_namespaces]]
-# binding = "OAUTH_KV"
-# id = "REPLACE_WITH_WRANGLER_KV_NAMESPACE_CREATE_OUTPUT"
-#
-# [env.rpg.vars]
-# CORPUS_NAME = "rpg"
-# OWNER_EMAIL = "you@example.com"
+
+# === cpr ===
+[env.cpr]
+name = "cpr"
+
+[env.cpr.ai]
+binding = "AI"
+
+[[env.cpr.vectorize]]
+binding = "VECTORIZE"
+index_name = "cpr"
+
+[[env.cpr.d1_databases]]
+binding = "DB"
+database_name = "cpr"
+database_id = "ada0c289-e459-4eaa-a9da-1cfc8cc2895d"
+
+[[env.cpr.durable_objects.bindings]]
+name = "MCP_OBJECT"
+class_name = "McpdfAgent"
+
+[[env.cpr.migrations]]
+tag = "v1"
+new_sqlite_classes = ["McpdfAgent"]
+
+[[env.cpr.kv_namespaces]]
+binding = "OAUTH_KV"
+id = "03fa000e58fb48a19d3e2ca93ae63a8d"
+
+[env.cpr.vars]
+CORPUS_NAME = "cpr"
+OWNER_EMAIL = "wgriffin@fraktured.net"

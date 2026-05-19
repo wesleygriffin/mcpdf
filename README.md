@@ -42,18 +42,7 @@ mcpdf/
 
 ## Credentials
 
-The CLI loads credentials from `~/Source/mm-env` by default (override with
-`MCPDF_ENV_FILE`):
-
-```sh
-chmod 600 ~/Source/mm-env
-cat > ~/Source/mm-env <<'EOF'
-CLOUDFLARE_ACCOUNT_ID=...
-CLOUDFLARE_API_TOKEN=...
-CLOUDFLARE_WORKERS_SUBDOMAIN=...workers.dev
-HF_TOKEN=hf_...
-EOF
-```
+The CLI loads credentials from `.env` by default (override with `MCPDF_ENV_FILE`):
 
 `wrangler` also picks up `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` from
 env, so `source`ing this file before Worker work is enough.
@@ -136,12 +125,12 @@ upserted by `(path, version)`.
 A remote MCP server (Streamable HTTP transport) that exposes four tools to
 clients like claude.ai:
 
-| Tool | What it does |
-| --- | --- |
-| `search` | Embeds the query via Workers AI, runs `topK` Vectorize lookup, returns hits with text, page range, content sha, and version. Optional filters: `document_path`, `version`, `document_sha256`. |
-| `list_documents` | Returns every `(path, version)` row from D1's `documents` table. Multiple versions of the same path appear as separate rows. |
+| Tool                | What it does |
+| ------------------- | --- |
+| `search`            | Embeds the query via Workers AI, runs `topK` Vectorize lookup, returns hits with text, page range, content sha, and version. Optional filters: `document_path`, `version`, `document_sha256`. |
+| `list_documents`    | Returns every `(path, version)` row from D1's `documents` table. Multiple versions of the same path appear as separate rows. |
 | `get_document_info` | Returns every version of `path`, or just one if `version` is given. |
-| `remove_document` | Without `version`, removes every version of `path`. With `version`, removes only that one. |
+| `remove_document`   | Without `version`, removes every version of `path`. With `version`, removes only that one. |
 
 The MCP endpoint is `/mcp` (Streamable HTTP). `/healthz` returns `ok` for
 uptime checks. The agent runs as a SQLite-backed Durable Object — one
@@ -163,12 +152,12 @@ cd worker
 1. **Provision Cloudflare resources**:
 
    ```sh
-   npx wrangler vectorize create studio --dimensions=768 --metric=cosine
-   npx wrangler vectorize create-metadata-index studio \
+   npx wrangler vectorize create CORPUS --dimensions=768 --metric=cosine
+   npx wrangler vectorize create-metadata-index CORPUS \
      --property-name=document_path --type=string
-   npx wrangler vectorize create-metadata-index studio \
+   npx wrangler vectorize create-metadata-index CORPUS \
      --property-name=version --type=string
-   npx wrangler d1 create studio          # note the printed UUID
+   npx wrangler d1 create CORPUS          # note the printed UUID
    ```
 
    The metadata indexes are what make `search`'s `document_path` and
@@ -179,7 +168,7 @@ cd worker
 2. **Create the D1 tables** — one for per-document metadata, one for per-chunk text:
 
    ```sh
-   npx wrangler d1 execute studio --remote --command "CREATE TABLE documents (
+   npx wrangler d1 execute CORPUS --remote --command "CREATE TABLE documents (
      path TEXT NOT NULL,
      version TEXT NOT NULL DEFAULT '',
      title TEXT NOT NULL,
@@ -206,15 +195,15 @@ cd worker
 3. **Provision the KV namespace for OAuth state**:
 
    ```sh
-   npx wrangler kv namespace create OAUTH_KV --env studio
+   npx wrangler kv namespace create OAUTH_KV --env CORPUS
    ```
 
    Paste the printed `id` into `wrangler.toml` at the
-   `[[env.studio.kv_namespaces]]` block, replacing
+   `[[env.CORPUS.kv_namespaces]]` block, replacing
    `REPLACE_WITH_WRANGLER_KV_NAMESPACE_CREATE_OUTPUT`.
 
-4. **Confirm `[env.studio]` block in `wrangler.toml`** (already present for
-   `studio`; copy the commented template at the bottom for new corpora and
+4. **Confirm `[env.CORPUS]` block in `wrangler.toml`** 
+   Copy the commented template at the bottom for new corpora and
    rename throughout). Paste the D1 UUID from step 1 and the KV id from
    step 3. Bindings are not inherited from the top-level config — every
    binding must be declared in the env block.
@@ -222,9 +211,9 @@ cd worker
 5. **Deploy**:
 
    ```sh
-   npx wrangler deploy --env studio
-   # → https://studio.<your-subdomain>.workers.dev
-   curl https://studio.<your-subdomain>.workers.dev/healthz   # → ok
+   npx wrangler deploy --env CORPUS
+   # → https://CORPUS.fraktured.workers.dev
+   curl https://CORPUS.fraktured.workers.dev/healthz   # → ok
    ```
 
 6. **Gate `/authorize` with Cloudflare Access.** Auth is handled by Zero
@@ -232,8 +221,7 @@ cd worker
    Cloudflare dashboard → Zero Trust → Access → Applications → Add an
    application → Self-hosted:
 
-   - **Application Domain**: the worker host (e.g.
-     `studio.fraktured.workers.dev`).
+   - **Application Domain**: the worker host (e.g. `CORPUS.fraktured.workers.dev`).
    - **Path**: `/authorize` — *only*. Do NOT gate the whole hostname or
      any of `/register`, `/token`, `/.well-known/oauth-*`, `/mcp`. Those
      are reached by claude.ai server-to-server and have no Access session.
@@ -246,13 +234,12 @@ cd worker
    doesn't match):
 
    ```toml
-   [env.studio.vars]
-   CORPUS_NAME = "studio"
-   OWNER_EMAIL = "you@example.com"
+   [env.CORPUS.vars]
+   CORPUS_NAME = "CORPUS"
+   OWNER_EMAIL = "wgriffin@fraktured.net"
    ```
 
-   No secrets to set. The worker fails closed (403) if Access isn't in
-   front when it should be.
+   No secrets to set. The worker fails closed (403) if Access isn't in front when it should be.
 
 7. **Upload PDFs**:
 
@@ -265,20 +252,20 @@ cd worker
 8. **Add as a connector in claude.ai or Claude Desktop** — Settings →
    Connectors → Add custom connector. Just the URL:
 
-   - **URL**: `https://studio.<your-subdomain>.workers.dev/mcp`
+   - **URL**: `https://CORPUS.fraktured.workers.dev/mcp`
 
    The client will redirect you through the OAuth flow on first connect.
    If you're already logged in to Access (via the identity provider you
    configured), the entire `/authorize` step is invisible — the browser
    bounces through and back to claude.ai. If you're not logged in, you'll
    see the Access login page once. The MCP server name will read as
-   `studio` (the `CORPUS_NAME` var from the env block).
+   `CORPUS` (the `CORPUS_NAME` var from the env block).
 
 ### Local dev
 
 ```sh
 cd worker
-npx wrangler dev --env studio    # http://127.0.0.1:8787/healthz
+npx wrangler dev --env CORPUS    # http://127.0.0.1:8787/healthz
 ```
 
 `wrangler dev` uses remote bindings by default for AI / Vectorize / D1, so
@@ -295,9 +282,9 @@ not tied to a specific git provider — switch between GitHub and GitLab by
 reconnecting in the dashboard.
 
 The pattern is **one Worker per environment, each with its own CWB
-connection and branch filter**. For the production `studio` corpus:
+connection and branch filter**. For a production corpus:
 
-1. Cloudflare dashboard → Workers & Pages → `studio` → Settings →
+1. Cloudflare dashboard → Workers & Pages → `CORPUS` → Settings →
    **Builds** → **Connect**.
 2. Authorize the git provider, pick the `mcpdf` repo.
 3. Configure:
@@ -305,39 +292,13 @@ connection and branch filter**. For the production `studio` corpus:
    - **Root directory**: `worker` (wrangler.toml lives here, not at the
      repo root)
    - **Build command**: `npm ci`
-   - **Deploy command**: `npx wrangler deploy --env studio`
+   - **Deploy command**: `npx wrangler deploy --env CORPUS`
 4. Save. Pushes to `main` will now build and deploy automatically.
 
 Worker secrets persist across deploys — no need to re-set them. KV
 namespace, D1, and `send_email` bindings are re-attached on each deploy
 from `wrangler.toml`, so changes to those bindings (including the
 `destination_address` allowlist) *do* require a redeploy to take effect.
-
-### Dev/prod separation
-
-To iterate on worker code without risking the live corpus, add a second
-worker (e.g. `studio-dev`):
-
-1. Add an `[env.studio-dev]` block to `wrangler.toml` (copy `[env.studio]`,
-   rename throughout). Provision its own Vectorize index, D1 database, and
-   `documents` table — see [Adding a corpus](#adding-a-corpus). Use a small
-   set of test PDFs; the dev corpus doesn't need real data.
-2. Deploy it once manually: `npx wrangler deploy --env studio-dev`. CWB
-   attaches to existing deployed workers — the Builds tab only appears
-   after the first deploy.
-3. In the `studio-dev` worker's Builds settings, configure:
-   - **Branch**: any pattern that excludes `main` (e.g. `!main` or a
-     specific `dev` branch)
-   - **Deploy command**: `npx wrangler deploy --env studio-dev`
-
-Now main pushes deploy prod (`studio`); feature-branch pushes deploy dev
-(`studio-dev`). The two workers have entirely separate URLs, Vectorize
-indexes, D1 databases, and auth tokens.
-
-**Don't try to use Workers' built-in preview deployments for this.**
-Previews share bindings with the production worker, which means a dev query
-would hit your real `studio` D1 and Vectorize. Separate `[env.X]` blocks
-are the only way to get true isolation.
 
 ## How it works
 
