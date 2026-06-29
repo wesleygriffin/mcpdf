@@ -25,7 +25,7 @@ mcpdf/
 │   ├── indexer.py          # Orchestrates extract → ChunkRecord stream
 │   ├── cloudflare.py       # Workers AI + Vectorize + D1 REST client
 │   ├── cli.py              # `mcpdf-index extract` and `mcpdf-index upload`
-│   └── config.py           # Loads creds from ~/Source/mm-env
+│   └── config.py           # Loads creds from .env (override via MCPDF_ENV_FILE)
 └── worker/                 # TypeScript — Cloudflare Worker (MCP endpoint)
     ├── wrangler.toml       # Top-level + [env.X] blocks per corpus
     └── src/index.ts        # McpdfAgent (Durable Object) with 4 MCP tools
@@ -44,6 +44,14 @@ mcpdf/
 
 The CLI loads credentials from `.env` by default (override with `MCPDF_ENV_FILE`):
 
+```sh
+CLOUDFLARE_ACCOUNT_ID=...   # your Cloudflare account ID
+CLOUDFLARE_API_TOKEN=...    # token with Workers AI, Vectorize, and D1 permissions
+HF_TOKEN=...                # Hugging Face token (gated EmbeddingGemma tokenizer)
+```
+
+`CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` are required for `upload`;
+`HF_TOKEN` is required for `extract` (one-time gated tokenizer download).
 `wrangler` also picks up `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` from
 env, so `source`ing this file before Worker work is enough.
 
@@ -202,18 +210,17 @@ cd worker
    `[[env.CORPUS.kv_namespaces]]` block, replacing
    `REPLACE_WITH_WRANGLER_KV_NAMESPACE_CREATE_OUTPUT`.
 
-4. **Confirm `[env.CORPUS]` block in `wrangler.toml`** 
-   Copy the commented template at the bottom for new corpora and
-   rename throughout). Paste the D1 UUID from step 1 and the KV id from
-   step 3. Bindings are not inherited from the top-level config — every
-   binding must be declared in the env block.
+4. **Add the `[env.CORPUS]` block to `wrangler.toml`.** Copy an existing
+   `[env.X]` block and rename `X` → `CORPUS` throughout. Paste the D1 UUID
+   from step 1 and the KV id from step 3. Bindings are not inherited from
+   the top-level config — every binding must be declared in the env block.
 
 5. **Deploy**:
 
    ```sh
    npx wrangler deploy --env CORPUS
-   # → https://CORPUS.fraktured.workers.dev
-   curl https://CORPUS.fraktured.workers.dev/healthz   # → ok
+   # → https://CORPUS.<your-subdomain>.workers.dev
+   curl https://CORPUS.<your-subdomain>.workers.dev/healthz   # → ok
    ```
 
 6. **Gate `/authorize` with Cloudflare Access.** Auth is handled by Zero
@@ -221,7 +228,7 @@ cd worker
    Cloudflare dashboard → Zero Trust → Access → Applications → Add an
    application → Self-hosted:
 
-   - **Application Domain**: the worker host (e.g. `CORPUS.fraktured.workers.dev`).
+   - **Application Domain**: the worker host (e.g. `CORPUS.<your-subdomain>.workers.dev`).
    - **Path**: `/authorize` — *only*. Do NOT gate the whole hostname or
      any of `/register`, `/token`, `/.well-known/oauth-*`, `/mcp`. Those
      are reached by claude.ai server-to-server and have no Access session.
@@ -236,7 +243,7 @@ cd worker
    ```toml
    [env.CORPUS.vars]
    CORPUS_NAME = "CORPUS"
-   OWNER_EMAIL = "wgriffin@fraktured.net"
+   OWNER_EMAIL = "you@example.com"
    ```
 
    No secrets to set. The worker fails closed (403) if Access isn't in front when it should be.
@@ -252,7 +259,7 @@ cd worker
 8. **Add as a connector in claude.ai or Claude Desktop** — Settings →
    Connectors → Add custom connector. Just the URL:
 
-   - **URL**: `https://CORPUS.fraktured.workers.dev/mcp`
+   - **URL**: `https://CORPUS.<your-subdomain>.workers.dev/mcp`
 
    The client will redirect you through the OAuth flow on first connect.
    If you're already logged in to Access (via the identity provider you

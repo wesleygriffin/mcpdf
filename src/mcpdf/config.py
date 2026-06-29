@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 def _load_env_once() -> None:
     """Load credentials from the user's env file.
 
-    Search order: MCPDF_ENV_FILE if set, then ~/Source/mm-env, then a local .env.
+    Search order: MCPDF_ENV_FILE if set, then a local .env.
     Each call is no-op-safe; python-dotenv won't clobber values already in os.environ.
     """
     candidates: list[Path] = []

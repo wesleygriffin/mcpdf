@@ -93,7 +93,7 @@ CREATE TABLE chunks (
 `chunks.text` is the source of truth for chunk text. Worker `search` does a
 batched `SELECT … WHERE vector_id IN (…)` after the Vectorize query. **Do
 not put chunk text back into Vectorize metadata** — the 10KB metadata cap
-won't hold 1500-token chunks (we burned a session learning this).
+won't hold 1500-token chunks.
 
 ## Hard limits we design around
 
@@ -103,8 +103,8 @@ won't hold 1500-token chunks (we burned a session learning this).
 - **EmbeddingGemma via Workers AI**: 768-dim vectors, 2048 max tokens per
   input. HF-gated — license must be accepted at
   <https://huggingface.co/google/embeddinggemma-300m>.
-- **Workers Free**: 10k Neurons/day will throttle a bulk re-embed; user is
-  on a paid plan.
+- **Workers Free**: 10k Neurons/day will throttle a bulk re-embed; a paid
+  plan is recommended for the initial bulk upload.
 
 ## Credentials
 
@@ -125,7 +125,7 @@ Cloudflare Zero Trust dashboard:
 
 1. Zero Trust → Access → Applications → Add application → Self-hosted.
 2. Application Domain: the worker host (e.g.
-   `studio.fraktured.workers.dev`). **Path: `/authorize` only** — do not
+   `studio.<your-subdomain>.workers.dev`). **Path: `/authorize` only** — do not
    gate the whole hostname. `/register`, `/token`, `/.well-known/oauth-*`,
    and `/mcp` are reached by claude.ai server-to-server and must remain
    reachable without an Access session.
@@ -223,7 +223,5 @@ without `--env`. Use the `wrangler` commands directly.
 - **No tests yet** (Python or TS). Validation surface is `ruff check` +
   `tsc --noEmit` + `wrangler deploy --dry-run`. Adding a test framework
   would be welcome but not silently — discuss first.
-- **No CI YAML in the repo.** User chose Cloudflare Workers Builds
-  (dashboard-only) so the CI config isn't coupled to a specific git host.
-- **No git remote yet.** First commit hasn't been made; everything in
-  `git status` is uncommitted as of session handoff.
+- **No CI YAML in the repo.** Cloudflare Workers Builds (dashboard-only)
+  handles CI so the config isn't coupled to a specific git host.
