@@ -136,7 +136,8 @@ async def _upload_one_doc(
     *,
     dry_run: bool,
     version: str,
-) -> None:
+) -> bool:
+    """Upload one document; return False if it was skipped as unchanged."""
     doc = chunks[0]
     new_count = len(chunks)
     log.info(
@@ -148,16 +149,22 @@ async def _upload_one_doc(
         f" [version={version}]" if version else "",
     )
     if dry_run:
-        return
+        return True
 
-    # Look up previous chunk_count for this (path, version) so we can clean up
-    # ghost vectors+rows after a shrinkage re-upload.
+    # Look up the previous row for this (path, version): an identical PDF that
+    # chunked to the same count is skipped without re-embedding, and
+    # chunk_count lets us clean up ghost vectors+rows after a shrinkage
+    # re-upload. The documents row is written last, so its presence means the
+    # previous upload completed.
     prev = await client.d1_query(
         db_id,
-        "SELECT chunk_count FROM documents WHERE path = ? AND version = ?",
+        "SELECT chunk_count, content_sha256 FROM documents WHERE path = ? AND version = ?",
         [doc.document_path, version],
     )
     old_count = int(prev[0]["chunk_count"]) if prev else 0
+    if prev and prev[0]["content_sha256"] == doc.document_sha256 and old_count == new_count:
+        log.info("%s: unchanged, skipping", doc.document_path)
+        return False
 
     # Embed in batches; build vector records (no text in metadata — that lives
     # in the chunks table) and parallel chunk rows.
@@ -234,6 +241,7 @@ async def _upload_one_doc(
                 f"DELETE FROM chunks WHERE vector_id IN ({placeholders})",
                 list(batch_ids),
             )
+    return True
 
 
 async def _amain_upload(args: argparse.Namespace) -> int:
@@ -265,14 +273,18 @@ async def _amain_upload(args: argparse.Namespace) -> int:
             db_id = await client.d1_database_id_for_name(cfg.d1_database)
             log.info("Resolved D1 %s -> %s", cfg.d1_database, db_id)
         version = args.version or ""
+        skipped = 0
         for path, chunks in groups.items():
             try:
-                await _upload_one_doc(
+                uploaded = await _upload_one_doc(
                     client, cfg, chunks, db_id, dry_run=args.dry_run, version=version
                 )
             except CloudflareAPIError as exc:
                 log.error("FAIL %s: %s", path, exc)
                 return 1
+            if not uploaded:
+                skipped += 1
+    log.info("Done: %d uploaded, %d unchanged", len(groups) - skipped, skipped)
     return 0
 
 

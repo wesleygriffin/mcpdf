@@ -181,6 +181,12 @@ without `--env`. Use the `wrangler` commands directly.
   vectors and chunks rows (the old-count > new-count branch in
   `_upload_one_doc`). Don't remove that logic to "simplify" — it solves a
   real correctness issue.
+- **Upload skips unchanged docs.** If the `documents` row for `(path,
+  version)` already has the same `content_sha256` and `chunk_count`, the
+  doc is skipped with no embedding. Re-extracting and re-uploading a whole
+  directory is the intended way to pick up new or changed PDFs. If you
+  change chunking in a way that keeps the chunk count the same, delete the
+  rows (or `remove_document`) to force a re-embed.
 - **Wrangler binding changes don't take effect until a redeploy.** Editing
   `wrangler.toml` (e.g. pasting a real KV id over a placeholder) updates
   the *next* deploy's bindings; the live worker keeps the bindings it had
